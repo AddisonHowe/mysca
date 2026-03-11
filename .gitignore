@@ -3,6 +3,7 @@ _deprecated/
 **/.DS_Store
 data/*/structures/*.pdb
 out/*
+tests/_tmp/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
