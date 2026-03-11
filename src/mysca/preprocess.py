@@ -7,6 +7,11 @@ from numpy.typing import NDArray
 from collections import Counter
 import tqdm
 import scipy.sparse as sp
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+import torch
+torch.set_float32_matmul_precision("high")
 
 from mysca.mappings import SymMap, DEFAULT_MAP
 from mysca.helpers import iterblocks
@@ -256,6 +261,10 @@ def compute_weights(version="v1", **kwargs):
         return _compute_weights_v4(**kwargs)
     elif version == "v5":
         return _compute_weights_v5(**kwargs)
+    elif version == "v6":
+        return _compute_weights_v6(**kwargs)
+    elif version == "gpu":
+        return _compute_weights_torch(**kwargs)
     else:
         raise RuntimeError(f"Weight computation {version} not found")
 
@@ -411,6 +420,111 @@ def _compute_weights_v5(**kwargs):
     neigh_float[neigh_float == 0] = 1.0
     ws = 1.0 / neigh_float
 
+    return ws
+
+
+def _compute_weights_v6(**kwargs):
+    msa = kwargs["msa"]
+    block_size = kwargs["block_size"]
+    use_pbar = kwargs["use_pbar"]
+    seqsim_thresh = kwargs["seqsim_thresh"]
+    gap = kwargs["gap"]
+    num_aas = kwargs["num_aas"]
+
+    assert isinstance(msa[0,0], (np.int_)), \
+        f"Expected msa to have int data. Got {msa.dtype}"
+
+    nseqs, npos = msa.shape
+    thresh = seqsim_thresh * npos
+
+    msa_sparse = get_onehotmsa_sparse(msa, num_aas, gap)
+
+    neigh = np.zeros(nseqs, dtype=np.uint32)
+
+    # JAX compiled row counting
+    @jax.jit
+    def count_rows(data, indptr):
+        mask = data >= thresh
+        mask = mask.astype(jnp.int32)
+
+        # compute row sums from CSR structure
+        row_counts = jnp.add.reduceat(mask, indptr[:-1])
+        return row_counts
+
+    for i0 in tqdm.trange(0, nseqs, block_size, disable=not use_pbar):
+        i1 = min(i0 + block_size, nseqs)
+
+        counts_sparse = (msa_sparse[i0:i1] @ msa_sparse.T).tocsr()
+
+        data = jnp.array(counts_sparse.data)
+        indptr = jnp.array(counts_sparse.indptr)
+
+        row_counts = count_rows(data, indptr)
+
+        neigh[i0:i1] = np.array(row_counts)
+
+    neigh_float = neigh.astype(float)
+    neigh_float[neigh_float == 0] = 1.0
+    ws = 1.0 / neigh_float
+
+    return ws
+
+def _detect_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
+    return torch.device("cpu")
+
+
+def _compute_weights_torch(**kwargs):
+
+    msa = kwargs["msa"]
+    block_size = kwargs.get("block_size", 512)
+    use_pbar = kwargs["use_pbar"]
+    seqsim_thresh = kwargs["seqsim_thresh"]
+    gap = kwargs["gap"]
+
+    assert isinstance(msa[0, 0], np.integer), \
+        f"Expected msa to have int data. Got {msa.dtype}"
+
+    nseqs, npos = msa.shape
+    thresh = seqsim_thresh * npos
+
+    device = _detect_device()
+    if device == "cpu":
+        print("No device found. Reverting to version v5!")
+        return _compute_weights_v5(**kwargs)
+
+    # move msa to torch
+    msa_t = torch.as_tensor(msa, dtype=torch.int16, device=device)
+    neigh = torch.zeros(nseqs, dtype=torch.int32, device=device)
+    outer = range(0, nseqs, block_size)
+    if use_pbar:
+        outer = tqdm.trange(0, nseqs, block_size)
+
+    for i0 in outer:
+        i1 = min(i0 + block_size, nseqs)
+        block_i = msa_t[i0:i1]
+        counts = torch.zeros(i1 - i0, dtype=torch.int32, device=device)
+        for j0 in range(0, nseqs, block_size):
+            j1 = min(j0 + block_size, nseqs)
+            block_j = msa_t[j0:j1]
+            # broadcast comparison
+            matches = (
+                (block_i[:, None, :] == block_j[None, :, :]) &
+                (block_i[:, None, :] != gap) &
+                (block_j[None, :, :] != gap)
+            ).sum(dim=2)
+            counts += (matches >= thresh).sum(dim=1)
+        neigh[i0:i1] = counts[:]
+
+    neigh = neigh.cpu().numpy().astype(float)   
+    neigh[neigh == 0] = 1.0
+
+    ws = 1.0 / neigh
     return ws
 
 

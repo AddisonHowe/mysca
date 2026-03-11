@@ -1,6 +1,7 @@
 channels:
   - conda-forge
   - bioconda
+  - pytorch
 dependencies:
   - python=3.12
   - numpy
@@ -16,3 +17,6 @@ dependencies:
   - ipykernel
   - ipywidgets
   - pytest
+  - pytorch
+  - torchvision
+  - torchaudio

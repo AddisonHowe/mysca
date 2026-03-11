@@ -90,6 +90,11 @@ def parse_args(args):
     
     parser.add_argument("--syms", type=str, default="default")
     parser.add_argument("--gapsym", type=str, default="-")
+    parser.add_argument("--weight_method", type=str, default="v5", 
+                        choices=["v3", "v4", "v5", "gpu"],
+                        help="method to use for weight computations")
+    parser.add_argument("--block_size", type=int, default=512, 
+                        help="block size to use for relevant weight computations")
     
     sca_params = parser.add_argument_group("SCA parameters")
     sca_params.add_argument(
@@ -127,6 +132,8 @@ def main(args):
     verbosity = args.verbosity
     pbar = args.pbar
     do_plot = args.plot
+    weight_computation_version = args.weight_method
+    block_size = args.block_size
     
     syms = args.syms
     gapsym = args.gapsym
@@ -183,6 +190,8 @@ def main(args):
         position_gap_thresh=position_gap_thresh,
         use_pbar=pbar,
         verbosity=verbosity,
+        weight_computation_version=weight_computation_version,
+        block_size=block_size,
     )
 
     msa_binary3d = preprocessing_results["msa_binary3d"]
