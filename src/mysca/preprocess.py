@@ -561,7 +561,7 @@ def get_onehotmsa_sparse(msa, num_aa, gap):
     pos = np.tile(np.arange(npos, dtype=np.uint16), nseqs)
     mask = a < num_aa
     cols = pos[mask] * num_aa + a[mask]
-    data = np.ones(cols.shape[0], dtype=np.uint8)
+    data = np.ones(cols.shape[0], dtype=np.int16)
 
     onehotmsa = sp.csr_matrix(
         (data, (rows[mask], cols)), 
