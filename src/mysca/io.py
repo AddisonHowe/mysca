@@ -58,7 +58,7 @@ def load_msa(
 
     # Keep records in the MSA not containing excluded symbols.
     exc_recs_screen = np.array([
-        any([sym in str(record.seq) for sym in mapping.exclude_syms]) 
+        any(mapping.is_excluded(sym) for sym in str(record.seq))
         for record in msa_obj
     ], dtype=bool)
 
@@ -71,12 +71,11 @@ def load_msa(
     msa_obj = MultipleSeqAlignment(keep_records)
 
     if verbosity > 1:
-        print(f"Removed {exc_recs_screen.sum()} seqs with excluded syms.")
+        print(f"Removed {exc_recs_screen.sum()} seqs with excluded symbols.")
 
     # Construct the MSA matrix.
     msa_matrix = np.array([
-        [mapping[aa] for aa in record.seq] for record in msa_obj 
-        if np.all([excsym not in record.seq for excsym in mapping.exclude_syms])
+        [mapping[aa] for aa in record.seq] for record in msa_obj
     ])
 
     # Retrieve MSA sequence IDs.

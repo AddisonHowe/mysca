@@ -17,6 +17,7 @@ from mysca.mappings import SymMap
 #####################
 
 SYMMAP1 = SymMap("ACDEF", '-')
+SYMMAP1_NO_EXCLUDE = SymMap("ACDEF", '-', exclude_syms="")
 SYMMAP1_EXC_X = SymMap("ACDEF", '-', "X")
         
 ###############################################################################
@@ -26,7 +27,8 @@ SYMMAP1_EXC_X = SymMap("ACDEF", '-', "X")
 @pytest.mark.parametrize(
         "fa_fpath, msa_shape_exp, symmap, expect_context", [
     [f"{DATDIR}/msas/msa01.faa", (5, 10), SYMMAP1, does_not_raise()],
-    [f"{DATDIR}/msas/msa02.faa", None, SYMMAP1, pytest.raises(KeyError)],
+    [f"{DATDIR}/msas/msa02.faa", (2, 10), SYMMAP1, does_not_raise()],
+    [f"{DATDIR}/msas/msa02.faa", None, SYMMAP1_NO_EXCLUDE, pytest.raises(KeyError)],
     [f"{DATDIR}/msas/msa02.faa", (2, 10), SYMMAP1_EXC_X, does_not_raise()],
     [f"{DATDIR}/msas/msa03.faa", (5, 10), SYMMAP1_EXC_X, does_not_raise()],
 ])
