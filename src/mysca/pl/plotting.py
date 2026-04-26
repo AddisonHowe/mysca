@@ -1,3 +1,6 @@
+import logging
+import os
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import to_hex
@@ -7,18 +10,51 @@ from mpl_toolkits.mplot3d import Axes3D
 
 import scipy
 import scipy.cluster.hierarchy as sch
+import scipy.stats
 from scipy.spatial.distance import pdist, squareform
 
 
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Each plotter follows the same save/return contract:
+#
+#   - outdir   : directory to save into. Default "." for library use;
+#                scripts pass their image output dir.
+#   - filename : output filename (within outdir). Default is the plot's
+#                conventional name; data-dependent plots (plot_data_2d/3d)
+#                derive one from the axis indices and group selection.
+#   - save     : if True (default), write the figure to disk and close it.
+#                Set save=False when using from a notebook / importing
+#                interactively — the function returns the open figure or
+#                axes so you can continue manipulating it.
+#
+# Single-axis plots return the Axes. Multi-axis plots return the Figure.
+# The __all__ in pl/__init__.py documents the public surface.
+# ---------------------------------------------------------------------------
+
+
+def _maybe_save(fig, save, outdir, filename):
+    """Save `fig` to ``{outdir}/{filename}`` and close it, iff save is True."""
+    if not save:
+        return
+    os.makedirs(outdir, exist_ok=True)
+    fig.savefig(os.path.join(outdir, filename), bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_data_2d(
-        ic_or_ev, axidxs, group_idxs, groups, 
-        data, 
-        imgdir,
+        ic_or_ev, axidxs, group_idxs, groups, data,
+        outdir=".",
+        *,
+        filename=None,
+        save=True,
 ):
     ic_or_ev = ic_or_ev.lower()
-    if ic_or_ev.lower() == "ic":
-        title = f"Groups in IC space"
-    elif ic_or_ev.lower() == "ev":
+    if ic_or_ev == "ic":
+        title = "Groups in IC space"
+    elif ic_or_ev == "ev":
         title = "Groups in EV space"
     else:
         raise RuntimeError("ic_or_ev should be `ic` or `ev`!")
@@ -26,24 +62,23 @@ def plot_data_2d(
         group_idxs = list(range(len(groups)))
     axi, axj = axidxs
     if axj >= data.shape[1]:
-        return
+        logger.debug(
+            "plot_data_2d: skipping %s axes (%d,%d); data has only %d columns.",
+            ic_or_ev.upper(), axi, axj, data.shape[1],
+        )
+        return None
     fig, ax = plt.subplots(1, 1)
-    # ax.axis("equal")
-    sc = ax.scatter(
-        data[:,axi], data[:,axj],
-        c='k', 
-        alpha=0.2, 
-        edgecolor='k',
+    ax.scatter(
+        data[:, axi], data[:, axj],
+        c='k', alpha=0.2, edgecolor='k',
     )
-    for i, gidx in enumerate(group_idxs):
+    for gidx in group_idxs:
         if gidx >= len(groups):
             continue
         g = groups[gidx]
         ax.scatter(
-            data[g,axi], data[g,axj],
-            alpha=1, 
-            edgecolor='k',
-            label=f"group {gidx}",
+            data[g, axi], data[g, axj],
+            alpha=1, edgecolor='k', label=f"group {gidx}",
         )
     ax.plot(0, 0, "ro")
     rx, ry = ax.get_xlim()[1], ax.get_ylim()[1]
@@ -53,23 +88,25 @@ def plot_data_2d(
     ax.set_xlabel(f"{ic_or_ev.upper()} {axi}")
     ax.set_ylabel(f"{ic_or_ev.upper()} {axj}")
     ax.set_title(title)
-    groupstr = "".join([str(i) for i in group_idxs])
-    plt.tight_layout()
-    plt.savefig(f"{imgdir}/{ic_or_ev}{axi}{axj}_groups_{groupstr}.png",
-                bbox_inches="tight")
-    plt.close()
-    return
+    fig.tight_layout()
+    if filename is None:
+        groupstr = "".join(str(i) for i in group_idxs)
+        filename = f"{ic_or_ev}{axi}{axj}_groups_{groupstr}.png"
+    _maybe_save(fig, save, outdir, filename)
+    return ax
 
 
 def plot_data_3d(
-        ic_or_ev, axidxs, group_idxs, groups, 
-        data, 
-        imgdir,
+        ic_or_ev, axidxs, group_idxs, groups, data,
+        outdir=".",
+        *,
+        filename=None,
+        save=True,
 ):
     ic_or_ev = ic_or_ev.lower()
-    if ic_or_ev.lower() == "ic":
-        title = f"ICA and identified groups"
-    elif ic_or_ev.lower() == "ev":
+    if ic_or_ev == "ic":
+        title = "ICA and identified groups"
+    elif ic_or_ev == "ev":
         title = ""
     else:
         raise RuntimeError("ic_or_ev should be `ic` or `ev`!")
@@ -77,49 +114,51 @@ def plot_data_3d(
         group_idxs = list(range(len(groups)))
     axi, axj, axk = axidxs
     if axk >= data.shape[1]:
-        return
-    fig = plt.figure(figsize=(12,5))
+        logger.debug(
+            "plot_data_3d: skipping %s axes (%d,%d,%d); data has only %d columns.",
+            ic_or_ev.upper(), axi, axj, axk, data.shape[1],
+        )
+        return None
+    fig = plt.figure(figsize=(12, 5))
     ax = fig.add_subplot(111, projection='3d')
-    # ax.axis("equal")
-    sc = ax.scatter(
-        data[:,axi], data[:,axj], data[:,axk], 
-        c="k", 
-        alpha=0.2, 
-        edgecolor='k',
+    ax.scatter(
+        data[:, axi], data[:, axj], data[:, axk],
+        c="k", alpha=0.2, edgecolor='k',
     )
-    for i, gidx in enumerate(group_idxs):
+    for gidx in group_idxs:
         if gidx >= len(groups):
             continue
         g = groups[gidx]
         ax.scatter(
-            data[g,axi], data[g,axj], data[g,axk], 
-            alpha=1, 
-            edgecolor='k',
-            label=f"group {gidx}",
+            data[g, axi], data[g, axj], data[g, axk],
+            alpha=1, edgecolor='k', label=f"group {gidx}",
         )
     ax.plot(0, 0, "ro")
     rx, ry, rz = ax.get_xlim()[1], ax.get_ylim()[1], ax.get_zlim()[1]
     ax.plot([0, rx], [0, 0], [0, 0], "k-", alpha=0.5)
     ax.plot([0, 0], [0, ry], [0, 0], "k-", alpha=0.5)
     ax.plot([0, 0], [0, 0], [0, rz], "k-", alpha=0.5)
-    ax.view_init(elev=30, azim=40)   # elev ~ tilt, azim ~ around z
+    ax.view_init(elev=30, azim=40)
     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     ax.set_xlabel(f"{ic_or_ev.upper()} {axi}")
     ax.set_ylabel(f"{ic_or_ev.upper()} {axj}")
     ax.set_zlabel(f"{ic_or_ev.upper()} {axk}")
     ax.set_title(title)
-    groupstr = "".join([str(i) for i in group_idxs])
-    plt.tight_layout()
-    plt.savefig(f"{imgdir}/{ic_or_ev}{axi}{axj}{axk}_groups_{groupstr}.png", 
-                bbox_inches="tight")
-    plt.close()
-    return
+    fig.tight_layout()
+    if filename is None:
+        groupstr = "".join(str(i) for i in group_idxs)
+        filename = f"{ic_or_ev}{axi}{axj}{axk}_groups_{groupstr}.png"
+    _maybe_save(fig, save, outdir, filename)
+    return ax
 
 
 def plot_dendrogram(
-        Cij, *, 
+        Cij,
+        outdir=".",
+        *,
         nclusters=10,
-        imgdir,
+        filename="dendrogram.png",
+        save=True,
 ):
     Z = sch.linkage(pdist(Cij, metric='euclidean'), method='ward')
     clusters = sch.fcluster(Z, t=nclusters, criterion='maxclust')
@@ -127,33 +166,28 @@ def plot_dendrogram(
     leaf_indices = dendro['leaves']
     cmap = plt.cm.turbo
     cluster_colors = [to_hex(cmap(i)) for i in np.linspace(0, 1, nclusters)]
+
     def color_func(link_idx):
         if link_idx < len(clusters):  # Only color leaf nodes
             return cluster_colors[clusters[link_idx] - 1]
         return "#000000"
+
     fig, (ax1, ax2) = plt.subplots(
-        1, 2, figsize=(7, 6), 
+        1, 2, figsize=(7, 6),
         gridspec_kw={'width_ratios': [0.2, 1]}
     )
     sch.dendrogram(
-        Z,
-        orientation='left',
-        ax=ax1,
-    #    color_threshold=max(Z[-nclusters+1, 2], 0.1),
+        Z, orientation='left', ax=ax1,
         link_color_func=color_func,
-        above_threshold_color='k'
+        above_threshold_color='k',
     )
     ax1.set_ylabel('Position', fontsize='x-large')
     ax1.set_xticks([])
     ax1.set_yticks([])
     rearranged_data = Cij[leaf_indices][:, leaf_indices]
-    im = ax2.imshow(
-        rearranged_data, 
-        aspect='auto', 
-        cmap='Blues',
-        interpolation='none', 
-        origin='lower', 
-        # vmin=0, vmax=1,
+    ax2.imshow(
+        rearranged_data, aspect='auto', cmap='Blues',
+        interpolation='none', origin='lower',
     )
     boundaries = np.where(np.diff(clusters[leaf_indices]))[0]
     for b in boundaries:
@@ -163,50 +197,58 @@ def plot_dendrogram(
     ax2.set_xlabel('Position', fontsize='x-large')
     ax2.set_xticks([])
     ax2.set_yticks([])
-    plt.tight_layout()
-    plt.savefig(f"{imgdir}/dendrogram.png", bbox_inches="tight")
-    plt.close()
-    return
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return fig
 
 
 def plot_sequence_similarity(
-        xmsa, imgdir
+        xmsa,
+        outdir=".",
+        *,
+        filename="sequence_similarity.png",
+        save=True,
 ):
     npos = xmsa.shape[1]
-    xmsa = xmsa.argmax(axis=-1)  # conversion
+    xmsa = xmsa.argmax(axis=-1)  # convert one-hot to int MSA
     distances = pdist(xmsa, metric="hamming")
     similarities = 1 - distances
     similarity_matrix = 1 - squareform(distances)
-    fig, [ax1, ax2] = plt.subplots(1, 2, figsize=(8,5))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 5))
 
     Z = sch.linkage(distances, method="complete", metric="hamming")
     dendro = sch.dendrogram(Z, no_plot=True)
     idxs = dendro["leaves"]
-    
-    ax1.hist(similarities, int(round(npos/2)))
+
+    ax1.hist(similarities, int(round(npos / 2)))
     ax1.set_xlabel("Pairwise sequence identities")
     ax1.set_ylabel("Count")
 
     sc = ax2.imshow(
         similarity_matrix[np.ix_(idxs, idxs)],
-        vmin=0, vmax=1,
-        interpolation="none",
+        vmin=0, vmax=1, interpolation="none",
     )
-    plt.colorbar(sc)
-    plt.tight_layout()
-    plt.savefig(f"{imgdir}/sequence_similarity.png", bbox_inches="tight")
-    plt.close()
-    return
+    fig.colorbar(sc, ax=ax2)
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return fig
 
 
-def plot_filter_history(filter_history, imgdir):
+def plot_filter_history(
+        filter_history,
+        outdir=".",
+        *,
+        filename="filter_history.png",
+        save=True,
+):
     """Plot the change in MSA size (sequences and positions) across filter stages.
 
     Args:
         filter_history: list of dicts as emitted by preprocess_msa. Each entry
-            must have `label`, `n_sequences`, `n_positions`, `n_filtered`,
-            and `axis` ("sequences", "positions", or None for "initial").
-        imgdir: output directory.
+            must have ``label``, ``n_sequences``, ``n_positions``,
+            ``n_filtered``, and ``axis`` ("sequences", "positions", or None
+            for "initial").
     """
     labels = [entry["label"] for entry in filter_history]
     n_seqs = [entry["n_sequences"] for entry in filter_history]
@@ -214,7 +256,9 @@ def plot_filter_history(filter_history, imgdir):
     n_stages = len(filter_history)
     x = np.arange(n_stages)
 
-    fig, (ax_seq, ax_pos) = plt.subplots(2, 1, figsize=(max(7, 1.5 * n_stages), 7))
+    fig, (ax_seq, ax_pos) = plt.subplots(
+        2, 1, figsize=(max(7, 1.5 * n_stages), 7)
+    )
 
     def _draw(ax, counts, affected_axis, axis_label, color):
         bar_colors = [
@@ -244,26 +288,81 @@ def plot_filter_history(filter_history, imgdir):
     _draw(ax_pos, n_pos, "positions", "# positions", "indianred")
     ax_seq.set_title("MSA size across filter stages")
 
-    plt.tight_layout()
-    plt.savefig(f"{imgdir}/filter_history.png", bbox_inches="tight")
-    plt.close()
-    return
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return fig
 
 
-def plot_filter_distributions(filter_history, imgdir):
+def plot_prealign_filter_history(
+        filter_history,
+        outdir=".",
+        *,
+        filename="prealign_filter_history.png",
+        save=True,
+):
+    """Sequence-count drop across prealign stages.
+
+    Prealign has no per-position filtering (alignment re-derives positions),
+    so this is a single-panel waterfall of sequence counts across the
+    initial → cluster → align stages.
+
+    Args:
+        filter_history: list of dicts. Each entry must have ``label``,
+            ``n_sequences``, ``n_filtered``, and ``stage`` (``"initial"``,
+            ``"cluster"``, or ``"align"``).
+    """
+    labels = [entry["label"] for entry in filter_history]
+    n_seqs = [entry["n_sequences"] for entry in filter_history]
+    n_stages = len(filter_history)
+    x = np.arange(n_stages)
+
+    fig, ax = plt.subplots(1, 1, figsize=(max(5, 1.5 * n_stages), 4))
+    bar_colors = [
+        "lightgray" if entry["stage"] == "initial" else "steelblue"
+        for entry in filter_history
+    ]
+    ax.bar(x, n_seqs, color=bar_colors, edgecolor="k")
+    for i, (xi, ci) in enumerate(zip(x, n_seqs)):
+        ax.text(xi, ci, f"{ci:,}", ha="center", va="bottom", fontsize=9)
+        if i > 0:
+            delta = n_seqs[i] - n_seqs[i - 1]
+            if delta != 0:
+                ax.text(
+                    xi, ci * 0.5, f"{delta:+,}",
+                    ha="center", va="center", fontsize=9, color="white",
+                    fontweight="bold",
+                )
+    ax.plot(x, n_seqs, "k-", alpha=0.3, zorder=0)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=30, ha="right")
+    ax.set_ylabel("# sequences")
+    ax.set_ylim(0, max(n_seqs) * 1.12 if max(n_seqs) > 0 else 1)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.set_title("Sequence count across prealign stages")
+
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return ax
+
+
+def plot_filter_distributions(
+        filter_history,
+        outdir=".",
+        *,
+        filename="filter_distributions.png",
+        save=True,
+):
     """Plot the distribution of the per-stage filter statistic with threshold.
 
     For each filtering stage (skipping the 'initial' record), draw a histogram
     of the statistic used to decide the filter (e.g. per-position gap
     frequency), with the threshold marked and the excluded region shaded.
-
-    Args:
-        filter_history: list of dicts as emitted by preprocess_msa.
-        imgdir: output directory.
+    Returns None when there are no entries with stat_values, since there is
+    no figure to return in that case.
     """
     entries = [e for e in filter_history if e.get("stat_values") is not None]
     if not entries:
-        return
+        return None
 
     n = len(entries)
     fig, axes = plt.subplots(n, 1, figsize=(7, 2.8 * n))
@@ -281,7 +380,6 @@ def plot_filter_distributions(filter_history, imgdir):
         counts, bins, patches = ax.hist(
             values, bins=nbins, color="steelblue", edgecolor="k", alpha=0.75,
         )
-        # Shade patches whose bin lies in the rejected region
         for patch, left, right in zip(patches, bins[:-1], bins[1:]):
             center = 0.5 * (left + right)
             rejected = (
@@ -307,39 +405,263 @@ def plot_filter_distributions(filter_history, imgdir):
         ax.legend(loc="upper right")
         ax.spines[["top", "right"]].set_visible(False)
 
-    plt.tight_layout()
-    plt.savefig(f"{imgdir}/filter_distributions.png", bbox_inches="tight")
-    plt.close()
-    return
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return fig
 
 
-def plot_t_distributions(v, t_dists_info, imgdir):
-    """Plot t distributions"""
-    npos, nics = v.shape
+def plot_t_distributions(
+        v, t_dists_info,
+        outdir=".",
+        *,
+        max_plots=None,
+        filename="t_distributions.png",
+        save=True,
+):
+    """Plot per-IC t-distribution fit with cutoff marker.
+
+    By default one subplot is rendered per column of ``v``. Pass
+    ``max_plots=N`` to render only the first ``N`` ICs (useful from
+    entrypoints that want to skip non-significant ICs without discarding
+    the saved ``t_dists_info`` for them).
+    """
+    _, nics = v.shape
+    if max_plots is not None:
+        nics = min(max_plots, nics)
+    if nics <= 0:
+        return None
     fig, axes = plt.subplots(nics, 1, figsize=(5, 3 * nics))
-    for i in range(v.shape[1]):
-        vi = v[:,i]
+    for i in range(nics):
+        vi = v[:, i]
         tinfo = t_dists_info[i]
-        if nics > 1:
-            ax = axes[i]
-        else:
-            ax = axes
-        ax.hist(
-            vi, bins=20, density=True, alpha=0.5, color="skyblue",
-        )
+        ax = axes[i] if nics > 1 else axes
+        ax.hist(vi, bins=20, density=True, alpha=0.5, color="skyblue")
         xlims = ax.get_xlim()
         ylims = ax.get_ylim()
         x = np.linspace(*xlims, 100)
         y = scipy.stats.t.pdf(
-            x, df=tinfo["df"], loc=tinfo["loc"], scale=tinfo["scale"], 
+            x, df=tinfo["df"], loc=tinfo["loc"], scale=tinfo["scale"],
         )
         ax.vlines(tinfo["cutoff"], *ylims, colors="k", linestyles="--")
         ax.plot(x, y)
         ax.set_xlim(*xlims)
         ax.set_ylim(*ylims)
         ax.set_xlabel(f"IC {i}")
-        ax.set_ylabel(f"p")
+        ax.set_ylabel("p")
         ax.set_title(f"IC {i} Student's $t$")
-    plt.tight_layout()
-    plt.savefig(f"{imgdir}/t_distributions.png", bbox_inches="tight")
-    plt.close()
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return fig
+
+
+def plot_conservation_top(
+        retained_positions, Di, num_positions_orig,
+        outdir=".",
+        *,
+        filename="top_conservation.png",
+        save=True,
+):
+    """Scatter of per-position relative entropy D_i at retained original
+    positions, with the x-axis spanning the original alignment length.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+    ax.plot(retained_positions, Di, "o", color="Blue", alpha=0.2)
+    ax.set_xlim(0, num_positions_orig)
+    ax.set_xlabel("Position")
+    ax.set_ylabel(r"Relative Entropy $D_i$")
+    ax.set_title("Conservation")
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return ax
+
+
+def plot_conservation_positional(
+        retained_positions, Di, num_positions_orig,
+        outdir=".",
+        *,
+        filename="positional_conservation.png",
+        save=True,
+):
+    """Bar chart of D_i at retained original positions, with the x-axis
+    spanning the original alignment length.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+    ax.bar(retained_positions, Di, color="Blue", width=1.0, align="center")
+    ax.set_xlim(0, num_positions_orig)
+    ax.set_xlabel("Position")
+    ax.set_ylabel(r"Relative Entropy $D_i$")
+    ax.set_title("Conservation")
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return ax
+
+
+def plot_conservation(
+        Di,
+        outdir=".",
+        *,
+        filename="conservation.png",
+        save=True,
+):
+    """Bar chart of D_i over the retained-position index axis (no mapping
+    back to original-MSA coordinates).
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+    ax.bar(np.arange(len(Di)), Di, color="Blue", width=1.0, align="center")
+    ax.set_xlabel("Position")
+    ax.set_ylabel(r"Relative Entropy $D_i$")
+    ax.set_title("Conservation")
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return ax
+
+
+def _plot_matrix_imshow(
+        matrix, title, *, xlabel, ylabel, cbar_label="Covariation",
+):
+    fig, ax = plt.subplots(1, 1)
+    sc = ax.imshow(
+        matrix, cmap="Blues", origin="lower", interpolation="none", vmax=None,
+    )
+    fig.colorbar(sc, label=cbar_label)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    return fig, ax
+
+
+def plot_covariance_matrix(
+        Cij_raw,
+        outdir=".",
+        *,
+        filename="covariance_matrix.png",
+        save=True,
+):
+    """Imshow of the raw (pre-weighting) covariance matrix."""
+    fig, _ax = _plot_matrix_imshow(
+        Cij_raw, "Covariance Matrix",
+        xlabel="(Retained) Position i",
+        ylabel="(Retained) Position j",
+    )
+    _maybe_save(fig, save, outdir, filename)
+    return fig
+
+
+def plot_sca_matrix(
+        Cij,
+        outdir=".",
+        *,
+        filename="sca_matrix.png",
+        save=True,
+):
+    """Imshow of the weighted SCA covariance matrix."""
+    fig, _ax = _plot_matrix_imshow(
+        Cij, "SCA Matrix",
+        xlabel="(Retained) Position i",
+        ylabel="(Retained) Position j",
+    )
+    _maybe_save(fig, save, outdir, filename)
+    return fig
+
+
+def plot_sca_spectrum(
+        evals_sca, evals_shuff,
+        outdir=".",
+        *,
+        filename="sca_matrix_spectrum.png",
+        save=True,
+):
+    """Overlay the SCA eigenvalue spectrum with each bootstrap null
+    sample's eigenvalue spectrum.
+    """
+    fig, ax = plt.subplots(1, 1)
+    for e in evals_shuff:
+        ax.plot(1 + np.arange(len(e)), e, ".", markersize=3)
+    ax.plot(
+        1 + np.arange(len(evals_sca)), evals_sca,
+        "k.", markersize=2, label="data",
+    )
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+    ax.set_xlabel(r"$\lambda$ index")
+    ax.set_ylabel(r"$\lambda$")
+    ax.set_title(r"$\tilde{C}_{ij}$ Spectrum (data vs null)")
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return fig
+
+
+def plot_sca_spectrum_vs_null(
+        evals_sca, evals_shuff, cutoff, n_boot,
+        outdir=".",
+        *,
+        filename="sca_matrix_spectrum_vs_null.png",
+        save=True,
+):
+    """Histograms of the SCA eigenvalues vs the pooled bootstrap null,
+    with the significance cutoff marked.
+    """
+    fig, ax = plt.subplots(1, 1)
+    _counts, bins, _patches = ax.hist(
+        evals_sca, bins=100, color="black", alpha=0.8, log=True, label="Data",
+    )
+    bin_centers = 0.5 * (bins[1:] + bins[:-1])
+    h, _ = np.histogram(np.asarray(evals_shuff).flatten(), bins=bins)
+    ax.axvline(cutoff, 0, 1, linestyle="--", color="grey")
+    denom = n_boot if n_boot else 1
+    ax.plot(bin_centers, h / denom, color="red", lw=1.5, label="Null")
+    ax.legend()
+    ax.set_xlabel(r"$\lambda$")
+    ax.set_ylabel("Count")
+    ax.set_title("Spectral decomposition")
+    fig.tight_layout()
+    _maybe_save(fig, save, outdir, filename)
+    return fig
+
+
+def plot_sca_matrix_sector_subset(
+        sca_mat_imp, groups, sector_color_set=None,
+        outdir=".",
+        *,
+        filename="sca_matrix_important_subset.png",
+        save=True,
+):
+    """Imshow of the sector-subset SCA matrix, optionally decorated with
+    sector-colored rugs along the top and right axes.
+    """
+    fig, ax = plt.subplots(1, 1)
+    sc = ax.imshow(
+        sca_mat_imp, cmap="Blues", origin="lower",
+        interpolation="none", vmax=None,
+    )
+    fig.colorbar(sc, label="Covariation")
+    ax.set_xlabel("(Important) Position i")
+    ax.set_ylabel("(Important) Position j")
+    ax.set_title("SCA Matrix (Groups)")
+
+    group_lengths = [len(g) for g in groups]
+    if sector_color_set and np.sum(group_lengths) > 0:
+        group_colors = np.concatenate([
+            len(g) * [colors.to_rgb(sector_color_set[i])]
+            for i, g in enumerate(groups) if len(g) > 0
+        ], axis=0)
+
+        divider = make_axes_locatable(ax)
+        ax_top = divider.append_axes("top", size="2%", pad=0.0, sharex=ax)
+        ax_top.imshow(
+            group_colors[None, :, :], aspect="auto",
+            extent=(0, len(group_colors), 0, 1),
+        )
+        ax_top.set_xticks([])
+        ax_top.set_yticks([])
+        ax_top.set_title(ax.get_title())
+        ax.set_title("")
+        ax_right = divider.append_axes("right", size="2%", pad=0.0, sharey=ax)
+        ax_right.imshow(
+            np.flip(group_colors, axis=0)[:, None, :], aspect="auto",
+            extent=(0, 1, 0, len(group_colors)),
+        )
+        ax_right.set_xticks([])
+        ax_right.set_yticks([])
+
+    _maybe_save(fig, save, outdir, filename)
+    return fig

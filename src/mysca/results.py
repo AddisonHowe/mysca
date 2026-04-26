@@ -20,13 +20,107 @@ PREPROCESSING_SYMMAP_FNAME = "sym2int.json"
 PREPROCESSING_ARGS_FNAME = "preprocessing_args.json"
 PREPROCESSING_MSAORIG_FNAME = "msa_orig.fasta-aln"
 PREPROCESSING_BINARY2D_FNAME = "msa_binary2d_sp.npz"
+PREPROCESSING_FILTER_HISTORY_FNAME = "filter_history.json"
+
+def _symmap_from_sym2int(sym2int):
+    """Rebuild a SymMap from a flat {symbol: int} dict.
+
+    The saved format carries no explicit gap marker, so gap identification
+    relies on the codebase convention ``"-"``. If ``"-"`` is absent, the
+    raw dict is returned unchanged so downstream ``sym_map[sym]`` lookups
+    still work.
+    """
+    from mysca.mappings import SymMap
+    if not isinstance(sym2int, dict):
+        return sym2int
+    gapsym = "-"
+    if gapsym not in sym2int:
+        return sym2int
+    sym_list = sorted(sym2int.keys(), key=lambda s: sym2int[s])
+    gap_value = sym_list.index(gapsym)
+    aa_list = [s for s in sym_list if s != gapsym]
+    return SymMap(
+        "".join(aa_list), gapsym, gap_value=gap_value,
+    )
+
+
+def _filter_history_to_jsonable(filter_history):
+    """Convert a filter_history list to JSON-serializable form.
+
+    ``stat_values`` entries are numpy arrays (or None); numpy scalars may
+    appear in ``n_sequences`` / ``n_filtered`` fields on some stages.
+    """
+    out = []
+    for entry in filter_history:
+        cleaned = {}
+        for k, v in entry.items():
+            if isinstance(v, np.ndarray):
+                cleaned[k] = v.tolist()
+            elif isinstance(v, np.generic):
+                cleaned[k] = v.item()
+            else:
+                cleaned[k] = v
+        out.append(cleaned)
+    return out
+
+
+def _filter_history_from_jsonable(raw):
+    """Inverse of _filter_history_to_jsonable: restore numpy arrays for
+    ``stat_values`` so downstream plotting code sees the same shape it
+    produced in-process.
+    """
+    out = []
+    for entry in raw:
+        restored = dict(entry)
+        sv = restored.get("stat_values")
+        if sv is not None:
+            restored["stat_values"] = np.asarray(sv)
+        out.append(restored)
+    return out
+
 
 SCARUN_RESULTS_FNAME = "scarun_results.npz"
 SCARUN_ARGS_FNAME = "scarun_args.json"
 SCARUN_EIGENDECOMP_FNAME = "sca_eigendecomp.npz"
-STATSECTORS_MSA_FNAME = "statsectors_msa.npz"
-STATSECTORS_SEQ_FNAME = "statsectors_seq.npz"
+IC_RESIDUES_PER_SEQ_FNAME = "ic_residues_per_seq.npz"
+IC_LOADINGS_PER_SEQ_FNAME = "ic_loadings_per_seq.npz"
 EVALS_SHUFF_FNAME = "evals_shuff.npy"
+
+
+def _describe_value(val):
+    """Compact shape/type description for a results field.
+
+    Returned as the ``value`` column in ``<container>.info()`` tables.
+    """
+    if val is None:
+        return "(none)"
+    if isinstance(val, np.ndarray):
+        return f"ndarray{tuple(val.shape)} {val.dtype}"
+    if isinstance(val, dict):
+        return f"dict (n={len(val)})"
+    if isinstance(val, list):
+        return f"list (n={len(val)})"
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return f"{type(val).__name__}={val}"
+    return type(val).__name__
+
+
+def _format_info_table(header, descriptions, value_fn):
+    lines = [header, "-" * len(header)]
+    name_w = max(len(n) for n in descriptions)
+    val_w = max(
+        (len(_describe_value(value_fn(n))) for n in descriptions), default=10,
+    )
+    val_w = max(val_w, 8)
+    lines.append(
+        f"{'field'.ljust(name_w)}  {'value'.ljust(val_w)}  description"
+    )
+    lines.append(f"{'-' * name_w}  {'-' * val_w}  {'-' * 11}")
+    for name, desc in descriptions.items():
+        lines.append(
+            f"{name.ljust(name_w)}  {_describe_value(value_fn(name)).ljust(val_w)}  {desc}"
+        )
+    return "\n".join(lines)
 
 
 class PreprocessingResults:
@@ -34,6 +128,10 @@ class PreprocessingResults:
 
     Provides named attribute access to preprocessing outputs and handles
     persistence to/from a directory of npz/json files.
+
+    Per-field descriptions are available at class level as
+    ``PreprocessingResults.FIELD_DESCRIPTIONS`` and can be rendered for
+    any instance via ``results.info()``.
 
     On-disk format (usable without mysca):
         preprocessing_results.npz
@@ -47,7 +145,73 @@ class PreprocessingResults:
         sym2int.json              : dict mapping symbols to integers
         msa_binary2d_sp.npz       : sparse CSR (M x 20L), one-hot MSA
         msa_orig.fasta-aln        : original MSA in FASTA format (optional)
+        filter_history.json       : list of per-stage filter diagnostics
+                                    (retained counts, threshold used, and
+                                    the stat distribution that fed the
+                                    filter). Needed to replay the
+                                    filter-diagnostic plots.
     """
+
+    FIELD_DESCRIPTIONS = {
+        "msa": (
+            "Processed MSA, int array (M x L). Each entry is the SymMap "
+            "integer for the residue at that (retained_sequence, "
+            "retained_position)."
+        ),
+        "msa_binary3d": (
+            "One-hot MSA, array (M x L x D) with D=len(alphabet). Gap "
+            "symbol is all-zero across the D axis."
+        ),
+        "retained_sequences": (
+            "Indices of retained sequences in the original MSA (1D int "
+            "array of length M)."
+        ),
+        "retained_positions": (
+            "Indices of retained positions in the original MSA (1D int "
+            "array of length L). Bridges processed→original coordinates: "
+            "original_col = retained_positions[processed_col]."
+        ),
+        "retained_sequence_ids": (
+            "IDs (strings) of retained sequences, aligned to "
+            "retained_sequences. Preserves input order."
+        ),
+        "sequence_weights": (
+            "Sampling weights per retained sequence (1D float array of "
+            "length M). Used throughout SCA for weighted frequencies."
+        ),
+        "fi0_pretruncation": (
+            "Per-position gap frequency before the first truncation step "
+            "(1D float array, length = original alignment length)."
+        ),
+        "args": (
+            "Dict of CLI arguments used to produce this result, for "
+            "reproducibility. Includes reference_id, thresholds, etc."
+        ),
+        "sym_map": (
+            "SymMap instance: the alphabet and gap symbol used. Integer "
+            "encoding of every symbol is stable across save/load."
+        ),
+        "msa_obj_orig": (
+            "Original MSA as a Biopython MultipleSeqAlignment (before any "
+            "filtering). Needed for raw-residue coordinate mapping."
+        ),
+        "filter_history": (
+            "List of per-stage filter diagnostics (counts, threshold, and "
+            "the statistic distribution that fed the filter). Consumed "
+            "by sca-plots for filter-diagnostic figures."
+        ),
+    }
+
+    def info(self):
+        """Return a human-readable summary of field descriptions and
+        current values on this instance. ``print(results.info())`` to
+        display. Field metadata lives on ``FIELD_DESCRIPTIONS``.
+        """
+        return _format_info_table(
+            "PreprocessingResults",
+            self.FIELD_DESCRIPTIONS,
+            lambda name: getattr(self, name, None),
+        )
 
     def __init__(
         self,
@@ -61,6 +225,7 @@ class PreprocessingResults:
         args,
         sym_map=None,
         msa_obj_orig=None,
+        filter_history=None,
     ):
         self.msa = msa
         self.msa_binary3d = msa_binary3d
@@ -72,6 +237,7 @@ class PreprocessingResults:
         self.args = args
         self.sym_map = sym_map
         self.msa_obj_orig = msa_obj_orig
+        self.filter_history = filter_history
 
     @property
     def n_sequences(self):
@@ -97,6 +263,7 @@ class PreprocessingResults:
             args=results_dict["args"],
             sym_map=sym_map,
             msa_obj_orig=msa_obj_orig,
+            filter_history=results_dict.get("filter_history"),
         )
 
     def save(self, outdir):
@@ -141,6 +308,12 @@ class PreprocessingResults:
                 format="fasta",
             )
 
+        if self.filter_history is not None:
+            with open(
+                os.path.join(outdir, PREPROCESSING_FILTER_HISTORY_FNAME), "w"
+            ) as f:
+                json.dump(_filter_history_to_jsonable(self.filter_history), f)
+
     @classmethod
     def load(cls, dirpath):
         """Load results from a directory previously created by save()."""
@@ -162,12 +335,17 @@ class PreprocessingResults:
             with open(args_path, "r") as f:
                 args = json.load(f)
 
-        # Load sym_map as plain dict
+        # Load sym_map and reconstruct a SymMap when possible. The on-disk
+        # representation is a flat symbol->int dict; the gap symbol is
+        # identified by the convention "-". Fall back to returning the raw
+        # dict if "-" is not present (the only downstream use that matters
+        # is indexed lookup via sym_map[aa], which works for both types).
         sym_map = None
         symmap_path = os.path.join(dirpath, PREPROCESSING_SYMMAP_FNAME)
         if os.path.isfile(symmap_path):
             with open(symmap_path, "r") as f:
-                sym_map = json.load(f)
+                sym2int = json.load(f)
+            sym_map = _symmap_from_sym2int(sym2int)
 
         # Load sparse binary MSA -> dense 3d
         msa_binary3d = None
@@ -187,6 +365,13 @@ class PreprocessingResults:
             except ImportError:
                 pass
 
+        # Filter history (needed to replay filter diagnostic plots)
+        filter_history = None
+        fh_path = os.path.join(dirpath, PREPROCESSING_FILTER_HISTORY_FNAME)
+        if os.path.isfile(fh_path):
+            with open(fh_path, "r") as f:
+                filter_history = _filter_history_from_jsonable(json.load(f))
+
         return cls(
             msa=msa,
             msa_binary3d=msa_binary3d,
@@ -198,11 +383,16 @@ class PreprocessingResults:
             args=args,
             sym_map=sym_map,
             msa_obj_orig=msa_obj_orig,
+            filter_history=filter_history,
         )
 
 
 class SCAResults:
     """Container for SCA core + analysis results.
+
+    Per-field descriptions are available at class level as
+    ``SCAResults.FIELD_DESCRIPTIONS`` and can be rendered for any instance
+    via ``results.info()``.
 
     On-disk format (usable without mysca):
         scarun_results.npz
@@ -216,19 +406,156 @@ class SCAResults:
         sca_eigendecomp.npz
             evals_sca, evecs_sca, significant_evals_sca, significant_evecs_sca
         scarun_args.json              : dict of SCA parameters
-        statsectors_msa.npz           : sector positions in MSA coordinates
-        statsectors_seq.npz           : sector positions in sequence coordinates
+        ic_residues_per_seq.npz       : per-target IC residues in raw-sequence
+                                        coordinates, keyed `ic_<i>_<seqid>`
+        ic_loadings_per_seq.npz       : per-residue IC loadings parallel to
+                                        ic_residues_per_seq, same key format
+        ic_positions/
+            ic_<i>_msaproc.npy        : high-load processed-MSA cols of IC i
+            ic_<i>_msaorig.npy        : same positions in original-MSA cols
+                                        (recovered via retained_positions)
+            ic_<i>_loadings.npy       : the IC's loadings at those positions
         sca_results/
             kstar.txt                 : number of significant eigenvalues used
             kstar_identified.txt      : number identified by bootstrap
+            n_components.txt          : number of ICs computed (>= kstar)
             eigenvalue_cutoff.txt     : bootstrap cutoff value
             v_ica_normalized.npy      : normalized ICA components
             w_ica.npy                 : ICA unmixing matrix
             t_dists_info.json         : t-distribution fit parameters
             evals_shuff.npy           : bootstrap eigenvalues
             sca_matrix_sector_subset.npy
-            msa_sectors/sector_*      : per-sector position and score arrays
     """
+
+    FIELD_DESCRIPTIONS = {
+        # Core SCA
+        "Dia": (
+            "Per-(position, amino acid) conservation contribution D_i^a "
+            "(float array L x D). Sums across the D axis give `conservation`."
+        ),
+        "conservation": (
+            "Position-wise relative entropy D_i (float array length L). "
+            "`conservation[i]` = sum_a D_i^a."
+        ),
+        "sca_matrix": (
+            "Weighted SCA covariance matrix φ_i^a ⊗ φ_j^b collapsed "
+            "to a (L x L) float array (what is eigendecomposed)."
+        ),
+        "phi_ia": (
+            "Per-(position, amino acid) weighting applied to covariances "
+            "(float array L x D)."
+        ),
+        "fi0": (
+            "Gap frequency at each position (float array length L), "
+            "weighted by `sequence_weights`."
+        ),
+        "fia": (
+            "Per-(position, amino acid) frequency (float array L x D), "
+            "weighted by `sequence_weights`."
+        ),
+        # Optional large arrays
+        "Cijab_raw": (
+            "Unreduced covariance tensor (L x L x D x D). Only populated "
+            "when `--save_all` was passed to sca-core."
+        ),
+        "fijab": (
+            "Unreduced joint-frequency tensor (L x L x D x D). Only "
+            "populated when `--save_all` was passed."
+        ),
+        "Cij_raw": (
+            "Reduced covariance matrix (L x L) prior to the phi_ia-weighted "
+            "step that yields `sca_matrix`. Persisted to disk so sca-plots "
+            "can replay the covariance-matrix plot without rerunning core."
+        ),
+        # Eigendecomposition
+        "evals_sca": (
+            "All eigenvalues of `sca_matrix`, sorted descending (float "
+            "array length L)."
+        ),
+        "evecs_sca": (
+            "All eigenvectors of `sca_matrix`, columns matching `evals_sca` "
+            "(float array L x L)."
+        ),
+        "significant_evals_sca": (
+            "Top-kstar eigenvalues (float array length kstar)."
+        ),
+        "significant_evecs_sca": (
+            "Top-kstar eigenvectors (float array L x kstar)."
+        ),
+        # Bootstrap / significance
+        "kstar": (
+            "Number of significant eigenvalues actually used (after any "
+            "--kstar override and the kstar>=1 fallback)."
+        ),
+        "kstar_identified": (
+            "Raw kstar from the bootstrap null (before any --kstar override)."
+        ),
+        "n_components": (
+            "Number of ICs computed by ICA; always >= kstar. Controlled by "
+            "--n_components (int or 'all')."
+        ),
+        "cutoff": (
+            "Eigenvalue significance cutoff derived from the bootstrap "
+            "null (float scalar)."
+        ),
+        "evals_shuff": (
+            "Bootstrap null eigenvalue spectrum (float array N_BOOT x L)."
+        ),
+        # ICA
+        "v_ica": (
+            "Normalized IC components (float array L x n_components). "
+            "Columns are the independent components of `evecs_sca`."
+        ),
+        "w_ica": (
+            "ICA unmixing matrix (float array n_components x n_components)."
+        ),
+        # IC positions (high-load, per-IC)
+        "ic_positions": (
+            "Per-IC list of high-load position indices (processed-MSA "
+            "coordinates) that cleared the per-IC t-distribution cutoff. "
+            "Length n_components; each entry is a 1D int array."
+        ),
+        "group_scores": (
+            "Per-IC list of IC loadings for the positions in "
+            "`ic_positions[i]` (same shape structure as `ic_positions`)."
+        ),
+        "t_dists_info": (
+            "List of per-IC t-distribution fits (df, loc, scale, cutoff) "
+            "used to nominate positions. Length n_components."
+        ),
+        "ic_residues_per_seq": (
+            "Per-target IC residues keyed `ic_{i}_{seqid}` in "
+            "raw-sequence residue coordinates. Only populated for the "
+            "top-kstar ICs and for sequences selected by `--sectors_for`."
+        ),
+        "ic_loadings_per_seq": (
+            "IC loadings parallel to `ic_residues_per_seq`, same "
+            "`ic_{i}_{seqid}` key format. The j-th value of "
+            "`ic_loadings_per_seq[ic_{i}_{seqid}]` is the IC i loading "
+            "at the residue `ic_residues_per_seq[ic_{i}_{seqid}][j]`."
+        ),
+        "sca_matrix_sector_subset": (
+            "Submatrix of `sca_matrix` restricted to all group positions "
+            "(concatenated). Shape (sum_i len(groups[i])) squared."
+        ),
+        # Args
+        "args": (
+            "Dict of CLI arguments used for this run (regularization, "
+            "kstar, n_components, pstar, assignment, seed, n_boot, "
+            "n_logged_comps)."
+        ),
+    }
+
+    def info(self):
+        """Return a human-readable summary of field descriptions and
+        current values on this instance. ``print(results.info())`` to
+        display. Field metadata lives on ``FIELD_DESCRIPTIONS``.
+        """
+        return _format_info_table(
+            "SCAResults",
+            self.FIELD_DESCRIPTIONS,
+            lambda name: getattr(self, name, None),
+        )
 
     def __init__(
         self,
@@ -251,17 +578,18 @@ class SCAResults:
         # Bootstrap / significance
         kstar=None,
         kstar_identified=None,
+        n_components=None,
         cutoff=None,
         evals_shuff=None,
         # ICA
         v_ica=None,
         w_ica=None,
-        # Sectors
-        groups=None,
+        # IC positions (high-load, per-IC)
+        ic_positions=None,
         group_scores=None,
         t_dists_info=None,
-        statsectors_msa=None,
-        statsectors_seq=None,
+        ic_residues_per_seq=None,
+        ic_loadings_per_seq=None,
         sca_matrix_sector_subset=None,
         # Args
         args=None,
@@ -281,23 +609,24 @@ class SCAResults:
         self.significant_evecs_sca = significant_evecs_sca
         self.kstar = kstar
         self.kstar_identified = kstar_identified
+        self.n_components = n_components
         self.cutoff = cutoff
         self.evals_shuff = evals_shuff
         self.v_ica = v_ica
         self.w_ica = w_ica
-        self.groups = groups
+        self.ic_positions = ic_positions
         self.group_scores = group_scores
         self.t_dists_info = t_dists_info
-        self.statsectors_msa = statsectors_msa
-        self.statsectors_seq = statsectors_seq
+        self.ic_residues_per_seq = ic_residues_per_seq
+        self.ic_loadings_per_seq = ic_loadings_per_seq
         self.sca_matrix_sector_subset = sca_matrix_sector_subset
         self.args = args
 
     @property
-    def n_sectors(self):
-        if self.groups is None:
+    def n_ic_positions(self):
+        if self.ic_positions is None:
             return None
-        return len(self.groups)
+        return len(self.ic_positions)
 
     @property
     def n_positions(self):
@@ -325,12 +654,16 @@ class SCAResults:
             args=args,
         )
 
-    def save(self, outdir, save_all=False):
+    def save(self, outdir, save_all=False, *, retained_positions=None):
         """Save results to the given directory.
 
         Args:
             outdir: Output directory path.
             save_all: If True, include large arrays (Cijab_raw, fijab).
+            retained_positions: Optional 1D int array mapping
+                processed-MSA col -> original-MSA col. When supplied,
+                the per-IC ic_positions/ic_<i>_msaorig.npy sibling is
+                written alongside ic_<i>_msaproc.npy.
         """
         scadir = os.path.join(outdir, "sca_results")
         os.makedirs(outdir, exist_ok=True)
@@ -346,6 +679,11 @@ class SCAResults:
                 "fi0": self.fi0,
                 "fia": self.fia,
             }
+            # Cij_raw is small (L x L) and needed for sca-plots replay of
+            # the covariance-matrix figure, so it rides along here rather
+            # than being gated on --save_all.
+            if self.Cij_raw is not None:
+                tosave["Cij_raw"] = self.Cij_raw
             if save_all:
                 if self.Cijab_raw is not None:
                     tosave["Cijab_raw"] = self.Cijab_raw
@@ -381,6 +719,11 @@ class SCAResults:
             np.savetxt(
                 os.path.join(scadir, "kstar.txt"),
                 [self.kstar], fmt="%d",
+            )
+        if self.n_components is not None:
+            np.savetxt(
+                os.path.join(scadir, "n_components.txt"),
+                [self.n_components], fmt="%d",
             )
         if self.cutoff is not None:
             np.savetxt(
@@ -420,32 +763,41 @@ class SCAResults:
                 self.sca_matrix_sector_subset,
             )
 
-        # Groups (sectors) in MSA coordinates
-        if self.groups is not None:
-            sector_dir = os.path.join(scadir, "msa_sectors")
-            groups_dir = os.path.join(outdir, "groups")
-            os.makedirs(sector_dir, exist_ok=True)
-            os.makedirs(groups_dir, exist_ok=True)
-            for i, group in enumerate(self.groups):
+        # Per-IC bundle: high-load positions in both coord spaces, plus
+        # the IC's loadings at those positions. Single source of truth
+        # at the top level; from_directory() loads from here.
+        if self.ic_positions is not None:
+            ic_pos_dir = os.path.join(outdir, "ic_positions")
+            os.makedirs(ic_pos_dir, exist_ok=True)
+            rp = (
+                np.asarray(retained_positions, dtype=int)
+                if retained_positions is not None else None
+            )
+            for i, positions in enumerate(self.ic_positions):
                 np.save(
-                    os.path.join(groups_dir, f"group_{i}_msapos.npy"), group
+                    os.path.join(ic_pos_dir, f"ic_{i}_msaproc.npy"),
+                    positions,
                 )
-                np.save(
-                    os.path.join(sector_dir, f"sector_{i}_msapos.npy"), group
-                )
+                if rp is not None:
+                    np.save(
+                        os.path.join(ic_pos_dir, f"ic_{i}_msaorig.npy"),
+                        rp[np.asarray(positions, dtype=int)],
+                    )
                 if self.group_scores is not None:
                     np.save(
-                        os.path.join(sector_dir, f"sector_{i}_scores.npy"),
+                        os.path.join(ic_pos_dir, f"ic_{i}_loadings.npy"),
                         self.group_scores[i],
                     )
-            # Combined mapping
-            group_idxs_all = np.concatenate(self.groups, axis=0)
-            msapos_to_groupidx = np.vstack([
-                group_idxs_all,
-                np.concatenate(
-                    [len(g) * [i] for i, g in enumerate(self.groups)], axis=0
-                ),
-            ])
+            # Combined mapping. Guard against the edge case where every IC
+            # has an empty position set — np.concatenate of all-empty lists
+            # raises.
+            from mysca.run_sca import _safe_concat_int
+            group_idxs_all = _safe_concat_int(self.ic_positions)
+            group_idx_labels = _safe_concat_int(
+                [np.full(len(g), i, dtype=int)
+                 for i, g in enumerate(self.ic_positions)]
+            )
+            msapos_to_groupidx = np.vstack([group_idxs_all, group_idx_labels])
             np.save(
                 os.path.join(scadir, "msapos_to_groupidx.npy"),
                 msapos_to_groupidx,
@@ -456,16 +808,17 @@ class SCAResults:
                 os.path.join(scadir, "all_important_positions.npy"), all_imp
             )
 
-        # Statistical sectors in MSA and sequence coordinates
-        if self.statsectors_msa is not None:
+        # Per-target IC residues (raw-sequence coords) and parallel
+        # IC loadings.
+        if self.ic_residues_per_seq is not None:
             np.savez_compressed(
-                os.path.join(outdir, STATSECTORS_MSA_FNAME),
-                **self.statsectors_msa,
+                os.path.join(outdir, IC_RESIDUES_PER_SEQ_FNAME),
+                **self.ic_residues_per_seq,
             )
-        if self.statsectors_seq is not None:
+        if self.ic_loadings_per_seq is not None:
             np.savez_compressed(
-                os.path.join(outdir, STATSECTORS_SEQ_FNAME),
-                **self.statsectors_seq,
+                os.path.join(outdir, IC_LOADINGS_PER_SEQ_FNAME),
+                **self.ic_loadings_per_seq,
             )
 
     @classmethod
@@ -475,7 +828,7 @@ class SCAResults:
 
         # Core SCA results
         Dia = conservation = sca_matrix = phi_ia = fi0 = fia = None
-        Cijab_raw = fijab = None
+        Cij_raw = Cijab_raw = fijab = None
         results_path = os.path.join(dirpath, SCARUN_RESULTS_FNAME)
         if os.path.isfile(results_path):
             data = np.load(results_path)
@@ -485,6 +838,7 @@ class SCAResults:
             phi_ia = data.get("phi_ia")
             fi0 = data.get("fi0")
             fia = data.get("fia")
+            Cij_raw = data.get("Cij_raw")
             Cijab_raw = data.get("Cijab_raw")
             fijab = data.get("fijab")
 
@@ -511,6 +865,9 @@ class SCAResults:
         kstar_identified = _load_scalar_txt(
             os.path.join(scadir, "kstar_identified.txt"), int
         )
+        n_components = _load_scalar_txt(
+            os.path.join(scadir, "n_components.txt"), int
+        )
         cutoff = _load_scalar_txt(
             os.path.join(scadir, "eigenvalue_cutoff.txt"), float
         )
@@ -536,39 +893,43 @@ class SCAResults:
             os.path.join(scadir, "sca_matrix_sector_subset.npy")
         )
 
-        # Groups from msa_sectors directory
-        groups = None
+        # IC positions + loadings from the top-level ic_positions/ dir.
+        ic_positions = None
         group_scores = None
-        sector_dir = os.path.join(scadir, "msa_sectors")
-        if os.path.isdir(sector_dir):
-            groups = []
+        ic_pos_dir = os.path.join(dirpath, "ic_positions")
+        if os.path.isdir(ic_pos_dir):
+            ic_positions = []
             group_scores = []
             i = 0
             while True:
-                gpath = os.path.join(sector_dir, f"sector_{i}_msapos.npy")
+                gpath = os.path.join(ic_pos_dir, f"ic_{i}_msaproc.npy")
                 if not os.path.isfile(gpath):
                     break
-                groups.append(np.load(gpath))
-                spath = os.path.join(sector_dir, f"sector_{i}_scores.npy")
+                ic_positions.append(np.load(gpath))
+                spath = os.path.join(ic_pos_dir, f"ic_{i}_loadings.npy")
                 if os.path.isfile(spath):
                     group_scores.append(np.load(spath))
                 i += 1
-            if not groups:
-                groups = None
+            if not ic_positions:
+                ic_positions = None
                 group_scores = None
             elif not group_scores:
                 group_scores = None
 
-        # Statistical sectors
-        statsectors_msa = None
-        msa_path = os.path.join(dirpath, STATSECTORS_MSA_FNAME)
-        if os.path.isfile(msa_path):
-            statsectors_msa = dict(np.load(msa_path, allow_pickle=True))
+        # Per-target IC residues + loadings.
+        ic_residues_per_seq = None
+        residues_path = os.path.join(dirpath, IC_RESIDUES_PER_SEQ_FNAME)
+        if os.path.isfile(residues_path):
+            ic_residues_per_seq = dict(
+                np.load(residues_path, allow_pickle=True)
+            )
 
-        statsectors_seq = None
-        seq_path = os.path.join(dirpath, STATSECTORS_SEQ_FNAME)
-        if os.path.isfile(seq_path):
-            statsectors_seq = dict(np.load(seq_path, allow_pickle=True))
+        ic_loadings_per_seq = None
+        loadings_path = os.path.join(dirpath, IC_LOADINGS_PER_SEQ_FNAME)
+        if os.path.isfile(loadings_path):
+            ic_loadings_per_seq = dict(
+                np.load(loadings_path, allow_pickle=True)
+            )
 
         return cls(
             Dia=Dia,
@@ -577,6 +938,7 @@ class SCAResults:
             phi_ia=phi_ia,
             fi0=fi0,
             fia=fia,
+            Cij_raw=Cij_raw,
             Cijab_raw=Cijab_raw,
             fijab=fijab,
             evals_sca=evals_sca,
@@ -585,15 +947,16 @@ class SCAResults:
             significant_evecs_sca=significant_evecs_sca,
             kstar=kstar,
             kstar_identified=kstar_identified,
+            n_components=n_components,
             cutoff=cutoff,
             evals_shuff=evals_shuff,
             v_ica=v_ica,
             w_ica=w_ica,
-            groups=groups,
+            ic_positions=ic_positions,
             group_scores=group_scores,
+            ic_residues_per_seq=ic_residues_per_seq,
+            ic_loadings_per_seq=ic_loadings_per_seq,
             t_dists_info=t_dists_info,
-            statsectors_msa=statsectors_msa,
-            statsectors_seq=statsectors_seq,
             sca_matrix_sector_subset=sca_matrix_sector_subset,
             args=args,
         )

@@ -1,80 +1,109 @@
 """SCA core pipeline
 
-Runs SCA, given preprocessed data.
-Stores all output in a specified directory.
-See references:
+Runs SCA on preprocessed data: computes the SCA covariance matrix,
+performs its eigendecomposition + bootstrap for significance, runs
+ICA on the top eigenvectors, and assigns positions to IC groups
+(sectors). Reference:
     [1] SI to Rivoire et al., 2016
+
+See `docs/cli_reference.md` for the canonical per-argument table.
 
 -------------------------------------------------------------------------------
 COMMAND LINE ARGUMENTS:
-    -i --indir : Path to preprocessed input data.
-    -o --outdir : Output directory.
-    --regularization : (Default 0.03) SCA regularization parameter λ.
-    -nb --n_boot : (Default 10) Number of bootstrap samples to perform in order
-        to determine the number of statistically significant components. If 0 
-        and `load_data` is specified, will attempt to load existing bootstrap
-        results and use these to determine the significance cutoff. If -1, will 
-        will skip bootstrapping and treat all components as significant.
-    --load_data : (Optional) Path to existing output with SCA results, to load.
-    --sectors_for : (Default None) Which sequences to generate per-sequence
-        sector mappings for. Default: only the reference sequence. Use 'all'
-        for every retained sequence, or provide a path to a text file
-        containing one sequence ID per line.
+
+Required:
+    -i --indir            : sca-preprocess output directory.
+    -o --outdir           : output directory for SCA results.
+
+SCA parameters (see SI of [1]):
+    --regularization λ    : SCA regularization (default 0.03).
+    --background          : optional JSON file of background frequencies
+                            (default: built-in DEFAULT_BACKGROUND_FREQ).
+    -nb --n_boot          : bootstrap iterations used to set the
+                            significance cutoff (default 10). 0 reuses an
+                            existing bootstrap from --load_data; -1 skips
+                            bootstrapping entirely (all evals significant).
+    -k --kstar            : override the bootstrap-derived kstar (0 keeps
+                            the bootstrap estimate).
+    --n_components        : number of ICs to compute (>= kstar). Integer
+                            or "all" (=L, the number of retained
+                            positions). Default: kstar.
+    -p --pstar            : percentile defining the t-distribution cutoff
+                            that nominates positions per IC (default 95).
+    --assignment          : "overlap" (default) keeps a qualifying
+                            position in every IC that nominates it;
+                            "exclusive" assigns only to the IC with the
+                            maximal projection.
+    --weak_assignment     : IC indices to exclude from the
+                            "exclusive" tie-break (ignored otherwise).
+    --n_logged_comps      : top-N ICs to emit in the human-readable
+                            summary log (default 10; 0 disables).
+    --sectors_for         : target sequences to expand into the
+                            per-seq output files (ic_residues_per_seq.npz
+                            + ic_loadings_per_seq.npz). Default: reference
+                            only. Pass "all" to include every retained
+                            sequence, or a path to a text file listing
+                            sequence IDs (one per line).
+
+Optional:
+    --seed                : random seed (None or non-positive auto-picks).
+    --load_data           : previous sca-core output directory to reload.
+    --save_all            : also write the large Cijab_raw / fijab arrays.
+    --use_jax             : use JAX in the core computations.
+    --nodendro            : skip the sequence-similarity / dendrogram plots.
+    --sector_cmap         : {"default", "none"} sector palette for the
+                            sector-subset plot.
+    --pbar                : tqdm progress bars for bootstrap iterations.
+    -v --verbosity        : 0=warnings only; higher = more detail.
 
 -------------------------------------------------------------------------------
-OUTPUTS:
+OUTPUTS (see docs/cli_reference.md ## sca-core for the exhaustive list):
 
-Core results are stored in a numpy archive file `scarun_results.npz`. Command 
-line arguments are stored `scarun_args.json`. A subdirectory 
-`sca_results` is created to store additional data. An `images` subdirectory is 
-also created.
+scarun_results.npz
+    Dia, conservation, sca_matrix, phi_ia, fi0, fia, Cij_raw; plus
+    Cijab_raw, fijab if --save_all.
 
-scarun_results.npz: (Computed SCA statistics)
-    Dia : Conservation measure per position and amino acid $D_i^a$.
-    conservation : Aggregated position-wise conservation measure $D_i$.
-    sca_matrix : Weighted SCA covariance matrix $\\tilde{C}_{ij}$.
-    phi_ia : Conservation weights $\\phi_i^a$.
-    fi0 : Gap frequency at each position $f_i^0$.
-    fia : Position-wise amino acid frequencies $f_i^a$.
+sca_eigendecomp.npz
+    Full + significant eigenvalues/eigenvectors of sca_matrix.
 
 scarun_args.json
-    Mapping from command line SCA parameters to their values.
+    CLI arguments used for the run.
 
-t_dists_info.json
-    Information pertaining to empirical distributions made to call statistical 
-    sectors.
+ic_residues_per_seq.npz
+    Per-target IC residues in raw-sequence coordinates, keyed
+    `ic_{i}_{seqid}`. Only top-kstar ICs expanded per sequence.
 
-sector_idxs.npy:
-    Integer array containing values [0, ..., K-1] where K is the number of 
-    identified statistical sectors.
-    
-sectors.npz:
-    sector_{i} : Positional indices defining sector i, wrt the input, PROCESSED 
-        MSA, for i in {0, ..., K-1}.
-
-sectors_msaorig.npz:
-    sector_{i} : Positional indices defining sector i, wrt the ORIGINAL MSA,
-        for i in {0, ..., K-1}.
-
-sectored_sequences.npz:
-    group_{gidx}_{id} : 
-
-statsectors_seq.npz:
+ic_loadings_per_seq.npz
+    Per-residue IC loadings parallel to ic_residues_per_seq, same
+    `ic_{i}_{seqid}` key format.
 
 sca_results/
-    Subdirectory for additional results.
-    
+    v_ica_normalized.npy, w_ica.npy, t_dists_info.json, evals_shuff.npy,
+    sca_matrix_sector_subset.npy, scalar txt files.
+
+ic_positions/
+    Per-IC bundle: ic_{i}_msaproc.npy (high-load positions in
+    processed-MSA cols), ic_{i}_msaorig.npy (the same positions in
+    original-MSA cols), ic_{i}_loadings.npy (IC loadings at those
+    positions).
+
+scarun.log
+    Run log including the human-readable top-N IC summary.
+
 images/
-    Subdirectory for generated images.
+    Conservation, SCA-matrix, spectrum, dendrogram, t-distribution,
+    EV/IC 2D/3D scatter, and sector-subset figures.
 
 -------------------------------------------------------------------------------
 EXAMPLE USAGE:
 
-sca-core -i </path/to/preprocessed/data> -o </path/to/outdir> \
-    --regularization 0.03 --background </path/to/background.json>
+    sca-core -i </preprocess-out> -o </scacore-out> --regularization 0.03
 
-sca-core -i </path/to/preprocessed/data> -o </path/to/outdir> \
-    --regularization 0.03 --load_data </path/to/existing/data>
+    sca-core -i </preprocess-out> -o </scacore-out> \\
+        --kstar 6 --n_components 10 --sectors_for all --seed 42
+
+    sca-core -i </preprocess-out> -o </scacore-out> \\
+        --n_boot 0 --load_data </existing-scacore-out>
 
 """
 
@@ -83,11 +112,6 @@ import logging
 import os, sys
 import warnings
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import to_hex
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-from matplotlib import colors
-from mpl_toolkits.mplot3d import Axes3D
 import tqdm as tqdm
 import json
 
@@ -101,11 +125,10 @@ from mysca.results import (
     SCAResults,
     SCARUN_RESULTS_FNAME as OUTPUT_RESULTS_FNAME,
     SCARUN_ARGS_FNAME as OUTPUT_ARGS_FNAME,
-    STATSECTORS_MSA_FNAME as OUTPUT_STATSECTORS_MSA_FNAME,
-    STATSECTORS_SEQ_FNAME as OUTPUT_STATSECTORS_SEQ_FNAME,
     EVALS_SHUFF_FNAME as EVALS_SHUFF_SAVEAS,
 )
 from mysca.core import run_sca, run_ica
+from mysca.preprocess import onehot_without_gap
 from mysca.helpers import get_rawseq_positions_in_groups
 from mysca.helpers import get_rawseq_scores_in_groups
 from mysca.helpers import get_group_rawseq_positions_by_entry
@@ -113,12 +136,42 @@ from mysca.helpers import get_group_rawseq_scores_by_entry
 from mysca.helpers import get_rawseq_indices_of_msa
 from mysca.constants import SECTOR_COLORS, DEFAULT_BACKGROUND_FREQ
 
-from mysca.pl.plotting import plot_sequence_similarity, plot_dendrogram
-from mysca.pl.plotting import plot_t_distributions, plot_data_2d, plot_data_3d
+from mysca.pl import (
+    plot_conservation,
+    plot_conservation_positional,
+    plot_conservation_top,
+    plot_covariance_matrix,
+    plot_data_2d,
+    plot_data_3d,
+    plot_dendrogram,
+    plot_sca_matrix,
+    plot_sca_matrix_sector_subset,
+    plot_sca_spectrum,
+    plot_sca_spectrum_vs_null,
+    plot_sequence_similarity,
+    plot_t_distributions,
+)
 
 SCARUN_LOG_FNAME = "scarun.log"
 
 logger = logging.getLogger("mysca.run_sca")
+
+
+def _n_components_type(s):
+    """argparse type converter for --n_components: positive int or 'all'."""
+    if isinstance(s, str) and s.lower() == "all":
+        return "all"
+    try:
+        v = int(s)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"--n_components must be a positive integer or 'all'; got {s!r}"
+        )
+    if v < 1:
+        raise argparse.ArgumentTypeError(
+            f"--n_components must be >= 1 or 'all'; got {v}"
+        )
+    return v
 
 
 def parse_args(args):
@@ -127,9 +180,13 @@ def parse_args(args):
                         help="Path to preprocessed data.")
     parser.add_argument("-o", "--outdir", type=str, required=True, 
                         help="Output directory.")
-    parser.add_argument("--pbar", action="store_true")
-    parser.add_argument("-v", "--verbosity", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--pbar", action="store_true",
+                        help="Enable tqdm progress bars during bootstrapping.")
+    parser.add_argument("-v", "--verbosity", type=int, default=1,
+                        help="Verbosity level (0=warnings only).")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility. None or a "
+                        "non-positive value auto-generates one.")
     
     parser.add_argument("--use_jax", action="store_true", 
                         help="Use JAX in computations.")
@@ -150,19 +207,43 @@ def parse_args(args):
                     help="Optional json file specifying background q.")
     sca_params.add_argument("-nb", "--n_boot", type=int, default=10, 
                     help="Number of bootstraps to use for eval threshold.")
-    sca_params.add_argument("-k", "--kstar", type=int, default=0, 
+    sca_params.add_argument("-k", "--kstar", type=int, default=0,
                     help="Value of k_start to override bootstrap estimate.")
-    sca_params.add_argument("-p", "--pstar", type=int, default=95, 
+    sca_params.add_argument(
+        "--n_components", type=_n_components_type, default=None,
+        help="Number of ICs to compute and save. Accepts a positive integer "
+        "or the string 'all' (meaning L, the number of retained positions). "
+        "Default: kstar (the number of significant eigenvalues). "
+        "Clamped to kstar as a lower bound; i.e. if n_components < kstar the "
+        "effective value is kstar.",
+    )
+    sca_params.add_argument("-p", "--pstar", type=int, default=95,
                     help="Percentile defining IC groups.")
+    sca_params.add_argument(
+        "--n_logged_comps", type=int, default=10,
+        help="Number of top ICs to summarize in the log after assignment "
+        "(significance marker, eigenvalue, MSA positions in processed / "
+        "unprocessed / reference coordinates). Default 10.",
+    )
+    sca_params.add_argument(
+        "--assignment", type=str, default="overlap",
+        choices=["overlap", "exclusive"],
+        help="How to assign a position that clears the t-distribution "
+        "cutoff for multiple ICs. 'overlap' (default): keep it in every "
+        "IC group where it qualifies. 'exclusive': assign only to the IC "
+        "where its IC-projection is maximal (this was the previous "
+        "default). --weak_assignment only applies under 'exclusive'.",
+    )
     sca_params.add_argument("--weak_assignment", type=int, nargs="*",
                         default=[])
 
     parser.add_argument("--sectors_for", type=str, default=None,
-                        help="Which sequences to generate per-sequence sector "
-                             "mappings for. Default: only the reference "
-                             "sequence. 'all' for every retained sequence, "
-                             "or a path to a text file with one sequence ID "
-                             "per line.")
+                        help="Which target sequences to expand into the "
+                             "per-seq output files (ic_residues_per_seq.npz "
+                             "+ ic_loadings_per_seq.npz). Default: only "
+                             "the reference sequence. 'all' for every "
+                             "retained sequence, or a path to a text file "
+                             "with one sequence ID per line.")
 
     return parser.parse_args(args)
 
@@ -181,6 +262,7 @@ def main(args):
     USE_JAX = args.use_jax
     SAVE_ALL = args.save_all
     sector_cmap = args.sector_cmap
+    assignment_method = args.assignment
     weak_assignment = args.weak_assignment
     sectors_for = args.sectors_for
 
@@ -188,6 +270,8 @@ def main(args):
     background_freq = args.background
     kstar = args.kstar
     pstar = args.pstar
+    n_components_arg = args.n_components
+    n_logged_comps = args.n_logged_comps
 
     if N_BOOT < 0:
         N_BOOT = 0
@@ -245,7 +329,7 @@ def main(args):
     retained_positions = prep.retained_positions
     weights = prep.sequence_weights
     msa_binary3d = prep.msa_binary3d
-    NSYMS = msa_binary3d.shape[-1]
+    NSYMS = len(sym_map)
     msa_obj_orig = prep.msa_obj_orig
     NUM_POS_ORIG = msa_obj_orig.get_alignment_length()
 
@@ -258,9 +342,9 @@ def main(args):
             for k in np.sort(list(background_freq.keys()))
         ),
     )
-    background_freq_array = np.zeros(len(background_freq))
-    for a in background_freq:
-        background_freq_array[sym_map[a]] = background_freq[a]    
+    background_freq_array = np.array(
+        [background_freq.get(a, 0.0) for a in sym_map.aa_list]
+    )
     background_freq_array = background_freq_array / background_freq_array.sum()
     
     # Run SCA
@@ -288,7 +372,7 @@ def main(args):
         results = existing
         Di = existing.conservation
         Cij = existing.sca_matrix
-        Cij_raw = None
+        Cij_raw = existing.Cij_raw  # None for saves from before Cij_raw persistence landed
 
     # Eigendecomposition of SCA matrix
     evals_sca, evecs_sca = np.linalg.eigh(Cij)
@@ -313,7 +397,7 @@ def main(args):
     if DO_SHUFFLING:
         for iteridx in tqdm.trange(N_BOOT):
             msa_shuff = shuffle_columns(msa, rng=rng)
-            xmsa_shuff = np.eye(NSYMS + 1, dtype=bool)[msa_shuff][:,:,:-1]
+            xmsa_shuff = onehot_without_gap(msa_shuff, NSYMS, sym_map.gapint)
             res = run_sca(
                 xmsa_shuff, weights,
                 background_map=background_freq,
@@ -375,6 +459,32 @@ def main(args):
     sig_evals_sca = evals_sca[:kstar]
     sig_evecs_sca = evecs_sca[:,:kstar]
 
+    # Determine how many ICs to compute (>= kstar). Default is kstar; "all"
+    # means len(evals_sca). Values below kstar are clamped up.
+    L_evecs = len(evals_sca)
+    if n_components_arg is None:
+        n_components = kstar
+    elif n_components_arg == "all":
+        n_components = L_evecs
+    else:
+        n_components = int(n_components_arg)
+    if n_components < kstar:
+        logger.warning(
+            "n_components=%d < kstar=%d; clamping to kstar.",
+            n_components, kstar,
+        )
+        n_components = kstar
+    if n_components > L_evecs:
+        logger.warning(
+            "n_components=%d exceeds number of eigenvectors (%d); clamping.",
+            n_components, L_evecs,
+        )
+        n_components = L_evecs
+    logger.info(
+        "Computing ICA on top %d eigenvectors (kstar=%d, L=%d).",
+        n_components, kstar, L_evecs,
+    )
+
     # Populate eigendecomposition on results
     results.evals_sca = evals_sca
     results.evecs_sca = evecs_sca
@@ -382,6 +492,7 @@ def main(args):
     results.significant_evecs_sca = sig_evecs_sca
     results.kstar = kstar
     results.kstar_identified = kstar_id
+    results.n_components = n_components
     results.cutoff = cutoff
     results.evals_shuff = evals_shuff
 
@@ -390,8 +501,9 @@ def main(args):
     ica_tol = 1e-7
     ica_maxiter = 1E6
     ica_max_attempts = 5
+    ica_input_evecs = evecs_sca[:, :n_components]
     v_ica_normalized, _, w_ica = apply_ica(
-        sig_evecs_sca,
+        ica_input_evecs,
         rho=ica_rho, tol=ica_tol, maxiter=ica_maxiter,
         max_attempts=ica_max_attempts,
     )
@@ -400,7 +512,14 @@ def main(args):
 
     # Fit t-distribution to each IC
     t_dists_info, top_idxs = fit_t_distributions(v_ica_normalized, p=pstar)
-    all_imp_idxs = np.concatenate(top_idxs, axis=0)
+    for i, idxs in enumerate(top_idxs):
+        if len(idxs) == 0:
+            logger.warning(
+                "IC %d: no positions cleared the t-distribution cutoff "
+                "at pstar=%d.",
+                i, pstar,
+            )
+    all_imp_idxs = _safe_concat_int(top_idxs)
     all_imp_idxs_unique = np.unique(all_imp_idxs)
     logger.info(
         "Identified %d important positions (with repeats).",
@@ -414,39 +533,39 @@ def main(args):
 
     # Call statistical sectors, i.e. groups of "co-evolving" positions.
     # Define groups from top p% empirical distribution.
-    # TODO: Compartmentalize this section and test.
-    groups = []
-    group_scores = []
-    for i, idx_set in enumerate(top_idxs):
-        group = []
-        group_score = []
-        for idx in idx_set:
-            if np.sum(all_imp_idxs == idx) == 1:
-                # Position is uniquely assigned to a group
-                group.append(idx)
-                group_score.append(v_ica_normalized[idx,i])
-            elif np.sum(all_imp_idxs == idx) > 1:
-                # Position is not uniquely assigned to a group.
-                # Assign to group only if projection onto ith IC is maximal
-                screen = ~np.isin(
-                    np.arange(v_ica_normalized.shape[1]), weak_assignment
-                )
-                if np.all(v_ica_normalized[idx,i] >= v_ica_normalized[idx,screen]):
-                    group.append(idx)
-                    group_score.append(v_ica_normalized[idx,i])
-            else:
-                raise RuntimeError("Index should be found amoung all...")
-        groups.append(np.array(group, dtype=int))
-        group_scores.append(np.array(group_score))
+    logger.info("Assigning positions to IC groups (method=%s).", assignment_method)
+    groups, group_scores = assign_positions_to_groups(
+        top_idxs,
+        v_ica_normalized,
+        method=assignment_method,
+        weak_assignment=weak_assignment,
+    )
 
-    # Subset the SCA matrix into grouped important positions
-    group_idxs_all = np.concatenate(groups, axis=0)
+    # Subset the SCA matrix into grouped important positions. If every IC
+    # ended up empty, the subset is a 0x0 matrix — log and carry on.
+    for i, g in enumerate(groups):
+        if len(g) == 0:
+            logger.info("IC %d: group is empty after assignment.", i)
+    group_idxs_all = _safe_concat_int(groups)
+    if len(group_idxs_all) == 0:
+        logger.warning(
+            "All IC groups are empty; sca_matrix_sector_subset will be 0x0."
+        )
     sca_mat_imp = Cij[group_idxs_all,:]
     sca_mat_imp = sca_mat_imp[:,group_idxs_all]
 
-    results.groups = groups
+    results.ic_positions = groups
     results.group_scores = group_scores
     results.sca_matrix_sector_subset = sca_mat_imp
+
+    # Human-readable top-N IC summary (significance marker + eigenvalue +
+    # processed / unprocessed / reference position mappings).
+    ref_id_for_log = prep.args.get("reference_id") if prep.args else None
+    log_top_ic_summary(
+        groups, kstar, evals_sca, retained_positions,
+        msa_obj_orig, ref_id_for_log,
+        n_logged_comps=n_logged_comps,
+    )
 
     # Determine which sequences to generate per-sequence sector mappings for.
     # IDs that were filtered out during preprocessing are silently skipped.
@@ -523,20 +642,34 @@ def main(args):
     group_rawseq_scores_by_entry = get_group_rawseq_scores_by_entry(
         msa_obj_orig, sector_seqidxs, groups, group_rawseq_scores
     )
-    msa_stat_sectors_data = {}
-    pdb_stat_sectors_data = {}
-    for gidx in range(len(groups)):
-        for i, seqidx in enumerate(sector_seqidxs):
+    # Per-target IC residues (and parallel IC loadings) scale with
+    # n_components × |sector_seqidxs| and dominate on-disk size when the
+    # user requests many ICs plus `--sectors_for all`. Restrict to the
+    # kstar significant ICs; non-significant ICs still have their
+    # position arrays on disk (via SCAResults.save) but aren't expanded
+    # per sequence.
+    ic_residues_per_seq = {}
+    ic_loadings_per_seq = {}
+    n_sector_groups = min(kstar, len(groups))
+    for gidx in range(n_sector_groups):
+        for seqidx in sector_seqidxs:
             entry = msa_obj_orig[int(seqidx)]
-            id = entry.id
-            group_arr = group_rawseq_positions_by_entry[id][gidx]
-            group_scores_arr = group_rawseq_scores_by_entry[id][gidx]
-            msa_stat_sectors_data[f"group_{gidx}_{id}"] = group_arr
-            pdb_stat_sectors_data[f"sector_{gidx}_pdbpos_{id}"] = group_arr
-            pdb_stat_sectors_data[f"sector_{gidx}_scores_{id}"] = group_scores_arr
+            sid = entry.id
+            residues = group_rawseq_positions_by_entry[sid][gidx]
+            loadings = group_rawseq_scores_by_entry[sid][gidx]
+            key = f"ic_{gidx}_{sid}"
+            ic_residues_per_seq[key] = residues
+            ic_loadings_per_seq[key] = loadings
+    if len(groups) > n_sector_groups:
+        logger.info(
+            "Per-target IC residues generated for the top %d "
+            "(significant) ICs only; %d additional non-significant IC "
+            "group(s) are saved as index files but not expanded per sequence.",
+            n_sector_groups, len(groups) - n_sector_groups,
+        )
 
-    results.statsectors_msa = msa_stat_sectors_data
-    results.statsectors_seq = pdb_stat_sectors_data
+    results.ic_residues_per_seq = ic_residues_per_seq
+    results.ic_loadings_per_seq = ic_loadings_per_seq
 
     # Save all results
     results.args = {
@@ -544,9 +677,14 @@ def main(args):
         "n_boot": int(N_BOOT),
         "seed": int(SEED),
         "kstar": int(kstar),
+        "n_components": int(n_components),
         "pstar": int(pstar),
+        "assignment": assignment_method,
+        "n_logged_comps": int(n_logged_comps),
     }
-    results.save(OUTDIR, save_all=SAVE_ALL)
+    results.save(
+        OUTDIR, save_all=SAVE_ALL, retained_positions=retained_positions,
+    )
 
     make_plots(
         retained_positions, 
@@ -624,6 +762,187 @@ def apply_ica(
     return v_ica_normalized, v_ica, w_ica
 
 
+_IC_LABEL_WIDTH = 15  # aligns "processed:" / "unprocessed:" / "reference ..."
+
+
+def _format_list(values):
+    """Render a homogeneous list to ``[a, b, c]`` without Python's
+    default-repr quoting of strings (so gap-representing ``"-"`` and
+    residue letters print bare)."""
+    return "[" + ", ".join(str(v) for v in values) + "]"
+
+
+def log_top_ic_summary(
+        groups, kstar, evals_sca, retained_positions,
+        msa_obj_orig, reference_id, *, n_logged_comps=10,
+):
+    """Write a human-readable summary of the top-N ICs to the module logger.
+
+    Each IC gets a header line (significance marker + eigenvalue +
+    position count) and a multi-line, left-aligned block showing:
+
+    - ``processed``: positions in the *processed* (post-filter) MSA.
+    - ``unprocessed``: same positions in the *original* (pre-filter)
+      MSA, via ``retained_positions``.
+    - ``reference pos``: residue indices in the reference's raw
+      (ungapped) sequence at each unprocessed position, with ``"-"``
+      where the reference has a gap.
+    - ``reference res``: residue letters at each reference position
+      (``"-"`` for gaps), useful for identifying the actual amino
+      acids involved without cross-referencing the MSA.
+
+    The reference block is only emitted when ``reference_id`` resolves
+    to a row in ``msa_obj_orig``; the header echoes the chosen
+    reference so downstream readers aren't guessing.
+
+    No-op when ``n_logged_comps <= 0`` or ``groups`` is empty.
+    """
+    if n_logged_comps <= 0 or not groups:
+        return
+
+    aligned_ref = None
+    ref_raw_positions = None
+    if reference_id is not None:
+        ids = [rec.id for rec in msa_obj_orig]
+        if reference_id in ids:
+            ref_row = ids.index(reference_id)
+            aligned_ref = str(msa_obj_orig[ref_row].seq)
+            all_raw = get_rawseq_indices_of_msa(msa_obj_orig)
+            ref_raw_positions = all_raw[ref_row]  # shape (npos_orig,)
+
+    n_show = min(n_logged_comps, len(groups))
+    header_tag = (
+        f"reference={reference_id}; " if aligned_ref is not None else ""
+    )
+    logger.info(
+        "Top %d/%d ICs (%s* significant, - not). "
+        "λ_i = i-th sorted SCA eigenvalue.",
+        n_show, len(groups), header_tag,
+    )
+    for i in range(n_show):
+        g = groups[i]
+        marker = "*" if i < kstar else "-"
+        eigval = float(evals_sca[i]) if i < len(evals_sca) else float("nan")
+        processed = [int(x) for x in g]
+        unprocessed = [int(retained_positions[x]) for x in g]
+
+        logger.info(
+            "IC %d: %s λ_%d=%.4g  (%d positions)",
+            i, marker, i, eigval, len(g),
+        )
+        logger.info(
+            "    %-*s%s",
+            _IC_LABEL_WIDTH, "processed:", _format_list(processed),
+        )
+        logger.info(
+            "    %-*s%s",
+            _IC_LABEL_WIDTH, "unprocessed:", _format_list(unprocessed),
+        )
+        if aligned_ref is not None:
+            ref_positions = [
+                int(ref_raw_positions[mp]) if ref_raw_positions[mp] >= 0
+                else "-"
+                for mp in unprocessed
+            ]
+            ref_residues = [aligned_ref[mp] for mp in unprocessed]
+            logger.info(
+                "    %-*s%s",
+                _IC_LABEL_WIDTH, "reference pos:", _format_list(ref_positions),
+            )
+            logger.info(
+                "    %-*s%s",
+                _IC_LABEL_WIDTH, "reference res:", _format_list(ref_residues),
+            )
+
+
+def _safe_concat_int(arrays):
+    """Concatenate a list of 1-D int arrays, returning an empty int array if
+    all inputs are empty. ``np.concatenate`` raises on an all-empty list, so
+    this guard lets callers handle the "no positions pass the cutoff" edge
+    case without special-casing it at every call site.
+    """
+    if not any(len(a) for a in arrays):
+        return np.array([], dtype=int)
+    return np.concatenate(arrays, axis=0)
+
+
+def assign_positions_to_groups(
+        top_idxs, v_ica_normalized, *,
+        method="overlap",
+        weak_assignment=(),
+):
+    """Resolve per-IC candidate positions into final groups.
+
+    Parameters
+    ----------
+    top_idxs : list[np.ndarray]
+        For each IC, the (ordered) indices that cleared the t-distribution
+        cutoff — as returned by ``fit_t_distributions``.
+    v_ica_normalized : np.ndarray, shape (L, n_components)
+        IC projections. Only consulted under ``method='exclusive'``.
+    method : {'overlap', 'exclusive'}
+        - ``'overlap'`` (default): each IC keeps its full ``top_idxs[i]``;
+          a position that clears the cutoff on multiple ICs appears in all
+          of them.
+        - ``'exclusive'``: a position that lands in multiple ICs' candidate
+          sets is assigned only to the IC where its IC-projection is
+          maximal, ignoring ICs listed in ``weak_assignment``.
+    weak_assignment : iterable[int]
+        IC indices to exclude from the max-projection tie-break. Only
+        applies under ``method='exclusive'``.
+
+    Returns
+    -------
+    groups : list[np.ndarray]
+        Indices per IC, ordered as they came out of ``fit_t_distributions``.
+    group_scores : list[np.ndarray]
+        ``v_ica_normalized[idx, i]`` for each ``idx`` in ``groups[i]``.
+    """
+    if method == "overlap":
+        groups = [np.asarray(idxs, dtype=int) for idxs in top_idxs]
+        group_scores = [
+            v_ica_normalized[idxs, i] if len(idxs) else np.array([], dtype=float)
+            for i, idxs in enumerate(groups)
+        ]
+        return groups, group_scores
+
+    if method == "exclusive":
+        if len(top_idxs) == 0:
+            return [], []
+        all_idxs = _safe_concat_int(top_idxs)
+        screen = ~np.isin(
+            np.arange(v_ica_normalized.shape[1]), list(weak_assignment)
+        )
+        groups = []
+        group_scores = []
+        for i, idx_set in enumerate(top_idxs):
+            group = []
+            group_score = []
+            for idx in idx_set:
+                hits = int(np.sum(all_idxs == idx))
+                if hits == 1:
+                    group.append(idx)
+                    group_score.append(v_ica_normalized[idx, i])
+                elif hits > 1:
+                    if np.all(
+                        v_ica_normalized[idx, i] >= v_ica_normalized[idx, screen]
+                    ):
+                        group.append(idx)
+                        group_score.append(v_ica_normalized[idx, i])
+                else:
+                    raise RuntimeError(
+                        "Index should be found among all candidate indices."
+                    )
+            groups.append(np.array(group, dtype=int))
+            group_scores.append(np.array(group_score))
+        return groups, group_scores
+
+    raise ValueError(
+        f"Unknown assignment method: {method!r}. "
+        "Expected 'overlap' or 'exclusive'."
+    )
+
+
 def fit_t_distributions(v, p):
     """Fit a t-dist to each IC, and return indices in the pth pctl of each.
     """
@@ -643,24 +962,6 @@ def fit_t_distributions(v, p):
     return t_dists_info, top_idxs
 
 
-def get_groups(v, p=95, method="t-dist"):
-    groups = []
-    to_be_assigned = np.ones(len(v), dtype=bool)
-    for i in range(v.shape[1]):
-        if method == "ecdf":
-            screen = v[:,i] >= np.percentile(v[to_be_assigned,i], p)
-        elif method == "t-dist":
-            df, loc, scale = scipy.stats.t.fit(v[:,i])
-            cutoff = scipy.stats.t.ppf(p/100, df, loc=loc, scale=scale)
-            screen = v[:,i] >= cutoff
-        else:
-            raise RuntimeError(f"Unknown method `{method}` for group calling.")
-        top_p_idxs = np.where(screen & to_be_assigned)[0]
-        to_be_assigned[top_p_idxs] = False
-        groups.append(top_p_idxs)
-    return groups
-
-
 def shuffle_columns(m, rng=None):
     rng = np.random.default_rng(rng)
     r, c = m.shape
@@ -668,11 +969,34 @@ def shuffle_columns(m, rng=None):
     return m[idx, np.arange(c)]
 
 
+EV_AXES_2D = [  # ((EVi, EVj), group_idxs)
+    ((0, 1), "all"),
+    ((1, 2), "all"),
+    ((2, 3), "all"),
+    ((3, 4), "all"),
+    ((4, 5), "all"),
+    ((5, 6), "all"),
+    ((0, 1), [0, 1, 2]),
+    ((1, 2), [0, 1, 2]),
+]
+
+EV_AXES_3D = [  # ((EVi, EVj, EVk), group_idxs)
+    ((0, 1, 2), "all"),
+    ((1, 2, 3), "all"),
+    ((0, 1, 2), [0, 1, 2]),
+    ((1, 2, 3), [0, 1, 2]),
+]
+
+# Sweep shape is identical for IC coords.
+IC_AXES_2D = EV_AXES_2D
+IC_AXES_3D = EV_AXES_3D
+
+
 def make_plots(
-        retained_positions, 
-        Di, 
+        retained_positions,
+        Di,
         NUM_POS_ORIG,
-        IMGDIR, 
+        IMGDIR,
         DENDRO,
         msa_binary3d,
         Cij_raw,
@@ -689,250 +1013,50 @@ def make_plots(
         sca_mat_imp,
         sector_color_set,
 ):
-    
-    # Plot conservation
-    fig, ax = plt.subplots(1, 1, figsize=(10,4))
-    ax.plot(
-        retained_positions, Di, "o",
-        color="Blue",
-        alpha=0.2
-    )
-    ax.set_xlim(0, NUM_POS_ORIG)
-    ax.set_xlabel(f"Position")
-    ax.set_ylabel("Relative Entropy $D_i$")
-    ax.set_title(f"Conservation")
-    plt.savefig(f"{IMGDIR}/top_conservation.png")
-    plt.close()
+    plot_conservation_top(retained_positions, Di, NUM_POS_ORIG, IMGDIR)
+    plot_conservation_positional(retained_positions, Di, NUM_POS_ORIG, IMGDIR)
+    plot_conservation(Di, IMGDIR)
 
-    # Plot conservation as a bar graph
-    fig, ax = plt.subplots(1, 1, figsize=(10,4))
-    ax.bar(
-        retained_positions, Di,
-        color="Blue",
-        width=1.0,
-        align="center",
-    )
-    ax.set_xlim(0, NUM_POS_ORIG)
-    ax.set_xlabel(f"Position")
-    ax.set_ylabel("Relative Entropy $D_i$")
-    ax.set_title(f"Conservation")
-    plt.savefig(f"{IMGDIR}/positional_conservation.png")
-    plt.close()
-
-    # Plot conservation as a bar graph, without mapping to original positions
-    fig, ax = plt.subplots(1, 1, figsize=(10,4))
-    ax.bar(
-        np.arange(len(Di)), Di,
-        color="Blue",
-        width=1.0,
-        align="center",
-    )
-    ax.set_xlabel(f"Position")
-    ax.set_ylabel("Relative Entropy $D_i$")
-    ax.set_title(f"Conservation")
-    plt.savefig(f"{IMGDIR}/conservation.png")
-    plt.close()
-
-    # Plot sequence similarity
     if DENDRO:
-        plot_sequence_similarity(
-            msa_binary3d, IMGDIR,
-        )
+        plot_sequence_similarity(msa_binary3d, IMGDIR)
 
-
-    # Plot Covariance Matrix
     if Cij_raw is not None:
-        fig, ax = plt.subplots(1, 1)
-        sc = ax.imshow(
-            Cij_raw, 
-            cmap="Blues", 
-            origin="lower",
-            interpolation="none",
-            vmax=None,
-        )
-        fig.colorbar(sc, label="Covariation")
-        ax.set_xlabel("(Retained) Position i")
-        ax.set_ylabel("(Retained) Position j")
-        ax.set_title("Covariance Matrix")
-        plt.savefig(f"{IMGDIR}/covariance_matrix.png")
-        plt.close()
+        plot_covariance_matrix(Cij_raw, IMGDIR)
 
-    # Plot SCA Matrix
-    fig, ax = plt.subplots(1, 1)
-    sc = ax.imshow(
-        Cij, 
-        cmap="Blues", 
-        origin="lower",
-        interpolation="none",
-        vmax=None,
+    plot_sca_matrix(Cij, IMGDIR)
+    plot_sca_spectrum(evals_sca, evals_shuff, IMGDIR)
+    plot_sca_spectrum_vs_null(
+        evals_sca, evals_shuff, cutoff, N_BOOT, IMGDIR,
     )
-    fig.colorbar(sc, label="Covariation")
-    ax.set_xlabel("(Retained) Position i")
-    ax.set_ylabel("(Retained) Position j")
-    ax.set_title("SCA Matrix")
-    plt.savefig(f"{IMGDIR}/sca_matrix.png")
-    plt.close()
 
-
-    # Plot SCA matrix spectrum null vs data
-    fig, ax = plt.subplots(1, 1)
-    for e in evals_shuff:
-        ax.plot(
-            1 + np.arange(len(e)), e, ".",
-            markersize=3
-        )
-    ax.plot(
-        1 + np.arange(len(evals_sca)), evals_sca,
-        "k.",
-        markersize=2,
-        label="data",
-    )
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    ax.set_xlabel(f"$\\lambda$ index")
-    ax.set_ylabel(f"$\\lambda$")
-    ax.set_title(f"$\\tilde{{C}}_{{ij}}$ Spectrum (data vs null)")
-    plt.savefig(f"{IMGDIR}/sca_matrix_spectrum.png")
-    plt.close()
-
-
-    # Plot eigenvalue distribution null vs data
-    fig, ax = plt.subplots(1, 1)
-    # Histogram of data eigenvalues
-    counts, bins, patches = ax.hist(
-        evals_sca, bins=100, color="black", alpha=0.8, log=True, label="Data"
-    )
-    bin_centers = 0.5 * (bins[1:] + bins[:-1])
-    h, bin_edges = np.histogram(evals_shuff.flatten(), bins=bins)
-    ax.axvline(cutoff, 0, 1, linestyle="--", color="grey")
-    ax.plot(
-        bin_centers, h / N_BOOT, 
-        color="red", 
-        lw=1.5, 
-        label="Null"
-    )
-    ax.legend()
-    ax.set_xlabel(f"$\\lambda$")
-    ax.set_ylabel(f"Count")
-    ax.set_title(f"Spectral decomposition")
-    plt.savefig(f"{IMGDIR}/sca_matrix_spectrum_vs_null.png")
-    plt.close()
-
-
-    # Dendrogram of SCA matrix
     if DENDRO:
-        plot_dendrogram(Cij, nclusters=kstar, imgdir=IMGDIR)
+        plot_dendrogram(Cij, IMGDIR, nclusters=kstar)
 
-
-    # Plot t-distributions
-    plot_t_distributions(v_ica_normalized, t_dists_info, IMGDIR)
-
-
-
-    # Plot data and groups in EV coords (2-dimensional)
-    EVIDXS_AND_GROUP_IDXS = [  # ((EVi, EVj), [group_indices])
-        ((0, 1), "all"),
-        ((1, 2), "all"),
-        ((2, 3), "all"),
-        ((3, 4), "all"),
-        ((4, 5), "all"),
-        ((5, 6), "all"),
-        ((0, 1), [0, 1, 2]),
-        ((1, 2), [0, 1, 2]),
-    ]
-    for evidxs, group_idxs in EVIDXS_AND_GROUP_IDXS:
-        plot_data_2d(
-            "ev", evidxs, group_idxs, groups, sig_evecs_sca, IMGDIR,
-        )
-    
-    # Plot data and groups in EV coords (3-dimensional)
-    EVIDXS_AND_GROUP_IDXS = [  # ((EVi, EVj, EVk), [group_indices])
-        ((0, 1, 2), "all"),
-        ((1, 2, 3), "all"),
-        ((0, 1, 2), [0, 1, 2]),
-        ((1, 2, 3), [0, 1, 2]),
-    ]
-    for evidxs, group_idxs in EVIDXS_AND_GROUP_IDXS:
-        plot_data_3d(
-            "ev", evidxs, group_idxs, groups, sig_evecs_sca, IMGDIR,
-        )
-    
-    # Plot data and groups in IC coords (2-dimensional)
-    ICIDXS_AND_GROUP_IDXS = [  # ((ICi, ICj), [group_indices])
-        ((0, 1), "all"),
-        ((1, 2), "all"),
-        ((2, 3), "all"),
-        ((3, 4), "all"),
-        ((4, 5), "all"),
-        ((5, 6), "all"),
-        ((0, 1), [0, 1, 2]),
-        ((1, 2), [0, 1, 2]),
-    ]
-    for icidxs, group_idxs in ICIDXS_AND_GROUP_IDXS:
-        plot_data_2d(
-            "ic", icidxs, group_idxs, groups, v_ica_normalized, IMGDIR,
-        )
-    
-    # Plot data and groups in IC coords (3-dimensional)
-    ICIDXS_AND_GROUP_IDXS = [  # ((ICi, ICj, ICk), [group_indices])
-        ((0, 1, 2), "all"),
-        ((1, 2, 3), "all"),
-        ((0, 1, 2), [0, 1, 2]),
-        ((1, 2, 3), [0, 1, 2]),
-    ]
-    for icidxs, group_idxs in ICIDXS_AND_GROUP_IDXS:
-        plot_data_3d(
-            "ic", icidxs, group_idxs, groups, v_ica_normalized, IMGDIR,
-        )
-
-    # Plot SCA Matrix "Important" subset
-    fig, ax = plt.subplots(1, 1)
-    sc = ax.imshow(
-        sca_mat_imp, 
-        cmap="Blues", 
-        origin="lower",
-        interpolation="none",
-        vmax=None,
+    plot_t_distributions(
+        v_ica_normalized, t_dists_info, IMGDIR, max_plots=kstar,
     )
-    fig.colorbar(sc, label="Covariation")
-    ax.set_xlabel("(Important) Position i")
-    ax.set_ylabel("(Important) Position j")
-    ax.set_title("SCA Matrix (Groups)")
 
-    # Add sector divisions if specified
-    group_lengths = [len(g) for g in groups]
-    if sector_color_set and np.sum(group_lengths) > 0:
-        group_colors = np.concatenate([
-            len(g) * [colors.to_rgb(sector_color_set[i])] 
-            for i, g in enumerate(groups) if len(g) > 0
-        ], axis=0)       
-        
-        divider = make_axes_locatable(ax)
-        # Top rug
-        ax_top = divider.append_axes("top", size="2%", pad=0.0, sharex=ax)
-        ax_top.imshow(
-            group_colors[None,:,:], 
-            aspect="auto", 
-            extent=(0, len(group_colors), 0, 1)
+    for axidxs, group_idxs in EV_AXES_2D:
+        plot_data_2d(
+            "ev", axidxs, group_idxs, groups, sig_evecs_sca, IMGDIR,
         )
-        ax_top.set_xticks([])
-        ax_top.set_yticks([])
-        ax_top.set_title(ax.get_title())
-        ax.set_title("")
-        # Right rug
-        ax_right = divider.append_axes("right", size="2%", pad=0.0, sharey=ax)
-        ax_right.imshow(
-            np.flip(group_colors, axis=0)[:,None,:], 
-            aspect="auto", 
-            extent=(0, 1, 0, len(group_colors))
+    for axidxs, group_idxs in EV_AXES_3D:
+        plot_data_3d(
+            "ev", axidxs, group_idxs, groups, sig_evecs_sca, IMGDIR,
         )
-        ax_right.set_xticks([])        
-        ax_right.set_yticks([])
+    for axidxs, group_idxs in IC_AXES_2D:
+        plot_data_2d(
+            "ic", axidxs, group_idxs, groups, v_ica_normalized, IMGDIR,
+        )
+    for axidxs, group_idxs in IC_AXES_3D:
+        plot_data_3d(
+            "ic", axidxs, group_idxs, groups, v_ica_normalized, IMGDIR,
+        )
 
-    plt.savefig(f"{IMGDIR}/sca_matrix_important_subset.png")
-    plt.close()
+    plot_sca_matrix_sector_subset(
+        sca_mat_imp, groups, sector_color_set, IMGDIR,
+    )
 
-    return
-    
 
 if __name__ == "__main__":
     args = parse_args(sys.argv[1:])

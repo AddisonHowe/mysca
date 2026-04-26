@@ -112,9 +112,77 @@ class TestPreprocessingResults:
             loaded.fi0_pretruncation, original.fi0_pretruncation
         )
         assert loaded.args == original.args
-        assert loaded.sym_map == original.sym_map
+        # load() reconstructs a SymMap; compare its sym2int against the
+        # original raw dict.
+        assert loaded.sym_map.sym2int == original.sym_map
         assert loaded.n_sequences == original.n_sequences
         assert loaded.n_positions == original.n_positions
+
+    def test_round_trip_filter_history(self):
+        """filter_history survives save/load with numpy arrays intact.
+
+        stat_values is typically an NDArray in-process; it has to round-trip
+        to a list in JSON and back to an array so replaying the filter
+        plots sees the same shape the original run produced.
+        """
+        original = self._make_sample_results()
+        original.filter_history = [
+            {
+                "stage": "initial",
+                "label": "initial",
+                "n_sequences": 10,
+                "n_positions": 8,
+                "n_filtered": 0,
+                "axis": None,
+                "stat_name": None,
+                "stat_values": None,
+                "threshold": None,
+                "threshold_symbol": None,
+                "filter_direction": None,
+            },
+            {
+                "stage": "position_gap",
+                "label": "position gap (τ)",
+                "n_sequences": 10,
+                "n_positions": 7,
+                "n_filtered": 1,
+                "axis": "positions",
+                "stat_name": "gap frequency per position",
+                "stat_values": np.array([0.0, 0.1, 0.5, 0.2]),
+                "threshold": 0.4,
+                "threshold_symbol": "τ",
+                "filter_direction": "above",
+            },
+        ]
+        original.save(OUTDIR_PREP)
+        loaded = PreprocessingResults.load(OUTDIR_PREP)
+
+        assert loaded.filter_history is not None
+        assert len(loaded.filter_history) == len(original.filter_history)
+        for orig_entry, loaded_entry in zip(
+            original.filter_history, loaded.filter_history
+        ):
+            orig_sv = orig_entry["stat_values"]
+            loaded_sv = loaded_entry["stat_values"]
+            if orig_sv is None:
+                assert loaded_sv is None
+            else:
+                assert isinstance(loaded_sv, np.ndarray)
+                np.testing.assert_array_equal(loaded_sv, orig_sv)
+            for key in (
+                "stage", "label", "n_sequences", "n_positions", "n_filtered",
+                "axis", "stat_name", "threshold", "threshold_symbol",
+                "filter_direction",
+            ):
+                assert loaded_entry[key] == orig_entry[key]
+
+    def test_round_trip_without_filter_history(self):
+        """A saved run with no filter_history loads back as None."""
+        original = self._make_sample_results()
+        assert original.filter_history is None
+        original.save(OUTDIR_PREP)
+        loaded = PreprocessingResults.load(OUTDIR_PREP)
+        assert loaded.filter_history is None
 
     def test_from_preprocess_output(self):
         """Test the factory that unpacks preprocess_msa() output format."""
@@ -189,6 +257,8 @@ class TestSCAResults:
         conservation = rng.random(L)
         sca_matrix = rng.random((L, L))
         sca_matrix = sca_matrix + sca_matrix.T  # symmetric
+        Cij_raw = rng.random((L, L))
+        Cij_raw = Cij_raw + Cij_raw.T  # symmetric
         phi_ia = rng.random((L, D))
         fi0 = rng.random(L)
         fia = rng.random((L, D))
@@ -205,6 +275,7 @@ class TestSCAResults:
             phi_ia=phi_ia,
             fi0=fi0,
             fia=fia,
+            Cij_raw=Cij_raw,
             evals_sca=evals_sca,
             evecs_sca=evecs_sca,
             significant_evals_sca=sig_evals,
@@ -224,7 +295,7 @@ class TestSCAResults:
         )
 
         if include_sectors:
-            results.groups = [
+            results.ic_positions = [
                 np.array([0, 3, 5]),
                 np.array([1, 7]),
                 np.array([2, 9, 11]),
@@ -235,20 +306,20 @@ class TestSCAResults:
                 rng.random(3),
             ]
             results.sca_matrix_sector_subset = rng.random((8, 8))
-            results.statsectors_msa = {
-                "group_0_seq1": np.array([0, 3, 5]),
-                "group_1_seq1": np.array([1, 7]),
+            results.ic_residues_per_seq = {
+                "ic_0_seq1": np.array([0, 3, 5]),
+                "ic_1_seq1": np.array([1, 7]),
             }
-            results.statsectors_seq = {
-                "sector_0_pdbpos_seq1": np.array([0, 3, 5]),
-                "sector_0_scores_seq1": rng.random(3),
+            results.ic_loadings_per_seq = {
+                "ic_0_seq1": rng.random(3),
+                "ic_1_seq1": rng.random(2),
             }
 
         return results
 
     def test_attributes(self):
         results = self._make_sample_results()
-        assert results.n_sectors == 3
+        assert results.n_ic_positions == 3
         assert results.n_positions == 12
         assert results.kstar == 3
         assert results.conservation.shape == (12,)
@@ -282,7 +353,7 @@ class TestSCAResults:
         # Eigen/ICA/sector fields should be None
         assert results.evals_sca is None
         assert results.v_ica is None
-        assert results.groups is None
+        assert results.ic_positions is None
 
     def test_save_creates_expected_files(self):
         results = self._make_sample_results()
@@ -298,9 +369,16 @@ class TestSCAResults:
             os.path.join(OUTDIR_SCA, "sca_eigendecomp.npz")
         )
         assert os.path.isfile(
-            os.path.join(OUTDIR_SCA, "statsectors_msa.npz")
+            os.path.join(OUTDIR_SCA, "ic_residues_per_seq.npz")
         )
         assert os.path.isfile(
+            os.path.join(OUTDIR_SCA, "ic_loadings_per_seq.npz")
+        )
+        # Legacy file names should not be written.
+        assert not os.path.isfile(
+            os.path.join(OUTDIR_SCA, "statsectors_msa.npz")
+        )
+        assert not os.path.isfile(
             os.path.join(OUTDIR_SCA, "statsectors_seq.npz")
         )
 
@@ -315,8 +393,34 @@ class TestSCAResults:
         assert os.path.isfile(
             os.path.join(scadir, "sca_matrix_sector_subset.npy")
         )
+        # IC positions live in the top-level ic_positions/ directory.
+        ic_pos_dir = os.path.join(OUTDIR_SCA, "ic_positions")
         assert os.path.isfile(
-            os.path.join(scadir, "msa_sectors", "sector_0_msapos.npy")
+            os.path.join(ic_pos_dir, "ic_0_msaproc.npy")
+        )
+        # Without retained_positions on save(), the msaorig sibling
+        # is not written; covered separately below.
+        assert not os.path.isfile(
+            os.path.join(ic_pos_dir, "ic_0_msaorig.npy")
+        )
+
+    def test_save_writes_msaorig_when_retained_positions_supplied(self):
+        """Passing retained_positions to save() writes the original-MSA
+        coord sibling alongside the processed-MSA file."""
+        results = self._make_sample_results()
+        # 12 processed-MSA cols (matches L_proc in _make_sample_results);
+        # map them onto a hypothetical L_orig=20 by scattering.
+        retained_positions = np.array(
+            [0, 2, 3, 5, 6, 8, 10, 12, 14, 15, 17, 19], dtype=int,
+        )
+        results.save(OUTDIR_SCA, retained_positions=retained_positions)
+        ic_pos_dir = os.path.join(OUTDIR_SCA, "ic_positions")
+        proc = np.load(os.path.join(ic_pos_dir, "ic_0_msaproc.npy"))
+        orig = np.load(os.path.join(ic_pos_dir, "ic_0_msaorig.npy"))
+        # ic_0 = [0, 3, 5] (processed), maps to retained_positions[[0,3,5]].
+        np.testing.assert_array_equal(proc, np.array([0, 3, 5]))
+        np.testing.assert_array_equal(
+            orig, retained_positions[np.array([0, 3, 5])],
         )
 
     def test_round_trip_core_fields(self):
@@ -333,7 +437,22 @@ class TestSCAResults:
         np.testing.assert_allclose(loaded.phi_ia, original.phi_ia)
         np.testing.assert_allclose(loaded.fi0, original.fi0)
         np.testing.assert_allclose(loaded.fia, original.fia)
+        # Cij_raw rides along with the rest of scarun_results.npz so
+        # sca-plots can render covariance_matrix.png on replay.
+        np.testing.assert_allclose(loaded.Cij_raw, original.Cij_raw)
         assert loaded.args == original.args
+
+    def test_round_trip_without_Cij_raw_is_graceful(self):
+        """A saved result without Cij_raw (legacy or sca-core run that
+        went through the LOAD_DATA path) loads back with Cij_raw=None —
+        no exception, no field key error."""
+        original = self._make_sample_results()
+        original.Cij_raw = None
+        original.save(OUTDIR_SCA)
+        loaded = SCAResults.load(OUTDIR_SCA)
+        assert loaded.Cij_raw is None
+        # Other fields still load correctly.
+        np.testing.assert_allclose(loaded.sca_matrix, original.sca_matrix)
 
     def test_round_trip_eigen_fields(self):
         """Save then load and verify eigendecomposition fields."""
@@ -377,35 +496,38 @@ class TestSCAResults:
         original.save(OUTDIR_SCA)
         loaded = SCAResults.load(OUTDIR_SCA)
 
-        assert loaded.n_sectors == original.n_sectors
-        for i in range(original.n_sectors):
+        assert loaded.n_ic_positions == original.n_ic_positions
+        for i in range(original.n_ic_positions):
             np.testing.assert_array_equal(
-                loaded.groups[i], original.groups[i]
+                loaded.ic_positions[i], original.ic_positions[i]
             )
             np.testing.assert_allclose(
                 loaded.group_scores[i], original.group_scores[i]
             )
 
-    def test_round_trip_statsectors(self):
-        """Save then load and verify statsectors npz dicts."""
+    def test_round_trip_per_seq_dicts(self):
+        """Save then load and verify ic_residues_per_seq /
+        ic_loadings_per_seq npz dicts."""
         original = self._make_sample_results()
         original.save(OUTDIR_SCA)
         loaded = SCAResults.load(OUTDIR_SCA)
 
-        assert set(loaded.statsectors_msa.keys()) == set(
-            original.statsectors_msa.keys()
+        assert set(loaded.ic_residues_per_seq.keys()) == set(
+            original.ic_residues_per_seq.keys()
         )
-        for k in original.statsectors_msa:
+        for k in original.ic_residues_per_seq:
             np.testing.assert_array_equal(
-                loaded.statsectors_msa[k], original.statsectors_msa[k]
+                loaded.ic_residues_per_seq[k],
+                original.ic_residues_per_seq[k],
             )
 
-        assert set(loaded.statsectors_seq.keys()) == set(
-            original.statsectors_seq.keys()
+        assert set(loaded.ic_loadings_per_seq.keys()) == set(
+            original.ic_loadings_per_seq.keys()
         )
-        for k in original.statsectors_seq:
+        for k in original.ic_loadings_per_seq:
             np.testing.assert_allclose(
-                loaded.statsectors_seq[k], original.statsectors_seq[k]
+                loaded.ic_loadings_per_seq[k],
+                original.ic_loadings_per_seq[k],
             )
 
     def test_save_all_includes_large_arrays(self):
@@ -467,7 +589,7 @@ class TestSCAResults:
         # Optional fields absent
         assert loaded.evals_sca is None
         assert loaded.v_ica is None
-        assert loaded.groups is None
+        assert loaded.ic_positions is None
         assert loaded.kstar is None
         assert loaded.evals_shuff is None
 
@@ -499,3 +621,86 @@ class TestSCAResults:
             os.path.join(OUTDIR_SCA, "sca_results", "kstar.txt")
         ))
         assert kstar == original.kstar
+
+
+class TestFieldDescriptions:
+    """FIELD_DESCRIPTIONS / info() contract for both result classes."""
+
+    def test_preprocessing_field_descriptions_cover_all_init_args(self):
+        """Every attribute set by PreprocessingResults.__init__ must have
+        a description entry so the info() output is never silently missing
+        a field."""
+        sample = PreprocessingResults(
+            msa=np.zeros((2, 3), dtype=int),
+            msa_binary3d=None,
+            retained_sequences=np.arange(2),
+            retained_positions=np.arange(3),
+            retained_sequence_ids=np.array(["a", "b"]),
+            sequence_weights=np.ones(2),
+            fi0_pretruncation=np.zeros(3),
+            args={},
+        )
+        init_attrs = set(vars(sample).keys())
+        described = set(PreprocessingResults.FIELD_DESCRIPTIONS.keys())
+        missing = init_attrs - described
+        assert not missing, f"FIELD_DESCRIPTIONS missing: {sorted(missing)}"
+        extras = described - init_attrs
+        assert not extras, (
+            f"FIELD_DESCRIPTIONS has entries with no matching attribute: "
+            f"{sorted(extras)}"
+        )
+
+    def test_sca_field_descriptions_cover_all_init_args(self):
+        sample = SCAResults()
+        init_attrs = set(vars(sample).keys())
+        described = set(SCAResults.FIELD_DESCRIPTIONS.keys())
+        missing = init_attrs - described
+        assert not missing, f"FIELD_DESCRIPTIONS missing: {sorted(missing)}"
+        extras = described - init_attrs
+        assert not extras, (
+            f"FIELD_DESCRIPTIONS has entries with no matching attribute: "
+            f"{sorted(extras)}"
+        )
+
+    def test_preprocessing_info_marks_populated_vs_none(self):
+        r = PreprocessingResults(
+            msa=np.zeros((2, 3), dtype=int),
+            msa_binary3d=None,
+            retained_sequences=np.arange(2),
+            retained_positions=np.arange(3),
+            retained_sequence_ids=np.array(["a", "b"]),
+            sequence_weights=np.ones(2),
+            fi0_pretruncation=np.zeros(3),
+            args={"threshold": 0.4},
+        )
+        text = r.info()
+        assert "PreprocessingResults" in text
+        # Populated ndarray fields show a shape/dtype description.
+        assert "retained_positions" in text
+        assert "ndarray(3,)" in text
+        # None fields render as "(none)".
+        lines = {
+            ln.split()[0]: ln
+            for ln in text.splitlines()
+            if ln and not ln.startswith(("-", " ", "P", "f"))
+        }
+        # msa_binary3d was left as None.
+        none_field_lines = [
+            ln for ln in text.splitlines() if "(none)" in ln
+        ]
+        assert any("msa_binary3d" in ln for ln in none_field_lines)
+
+    def test_sca_info_shows_scalars_and_none(self):
+        r = SCAResults(kstar=3, conservation=np.arange(5, dtype=float))
+        text = r.info()
+        assert "SCAResults" in text
+        assert "kstar" in text and "int=3" in text
+        assert "conservation" in text and "ndarray(5,)" in text
+        assert "(none)" in text  # many fields are left unset
+
+    def test_field_descriptions_are_class_level_constants(self):
+        """FIELD_DESCRIPTIONS should live on the class, not on instances."""
+        assert "FIELD_DESCRIPTIONS" in vars(PreprocessingResults)
+        assert "FIELD_DESCRIPTIONS" in vars(SCAResults)
+        r = SCAResults()
+        assert "FIELD_DESCRIPTIONS" not in vars(r)

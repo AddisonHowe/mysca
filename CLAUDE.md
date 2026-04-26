@@ -5,14 +5,23 @@ Project notes for Claude Code. See [README.md](README.md) for the user-facing in
 ## What this is
 
 `mysca` — Statistical Coupling Analysis (SCA) pipeline for identifying co-evolving
-amino acid sectors in protein multiple sequence alignments. Exposes three CLIs:
-`sca-preprocess`, `sca-core`, `sca-pymol`.
+amino acid sectors in protein multiple sequence alignments. Exposes seven CLIs:
+`sca-prealign`, `sca-preprocess`, `sca-core`,
+`sca-pymol` (renders sectors from `sca-structure` output; protein-specific
+annotations live in a user `--features_py` Python file),
+`sca-plots` (replay plotter that regenerates diagnostic figures from
+persisted results), `sca-project` (project primary-sequence records onto an
+existing SCA result), and `sca-structure` (project PDB structures, composing
+over `sca-project`).
 
 ## Layout
 
 - `src/mysca/` — package source. Core pipeline in `preprocess.py` + `core.py`;
-  CLIs in `run_preprocessing.py` / `run_sca.py` / `run_pymol.py` (orchestrator:
-  `run_full_pipeline.py`). On-disk result containers in `results.py`.
+  CLIs in `run_prealign.py` / `run_preprocessing.py` / `run_sca.py` /
+  `run_pymol.py` / `run_plots.py` / `run_project.py` / `run_structure.py`.
+  On-disk result containers in `results.py`; out-of-sample projection
+  lives in `project/` (library) + `run_project.py` (CLI); PDB /
+  tertiary integration in `structure/` + `run_structure.py`.
 - `tests/` — pytest suite. Fixtures in `conftest.py`; shared test MSAs/PDBs in
   `tests/_data/`; tmp output in `tests/_tmp/` (gitignored).
 - `docs/.claude_sessions/` — per-session notes (prior agent work, context).
@@ -38,3 +47,13 @@ an ad-hoc worktree.
 - Canonical AA alphabet is `AA_STD20` + `-` gap; non-canonical symbols trigger
   WARNING-level log entries (see `io.load_msa`, `run_preprocessing.py --syms`).
 - Prefer editing existing files over creating new ones; no speculative abstractions.
+- When adding / renaming / removing / changing default of an `argparse`
+  argument in any `run_*.py` entrypoint, update **all three** surfaces in
+  the same commit:
+  1. the `help=` string on the argument itself,
+  2. the `COMMAND LINE ARGUMENTS` / `OUTPUTS` section of the module's top
+     docstring,
+  3. the matching section in [docs/cli_reference.md](docs/cli_reference.md).
+  If the change affects what the entrypoint writes to disk, also update
+  the docstring of the corresponding container in
+  [src/mysca/results.py](src/mysca/results.py).

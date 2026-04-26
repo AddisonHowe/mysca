@@ -21,6 +21,20 @@ from mysca.helpers import iterblocks
 logger = logging.getLogger(__name__)
 
 
+def onehot_without_gap(
+        msa: NDArray[np.int_],
+        num_syms: int,
+        gapint: int,
+) -> NDArray[np.bool_]:
+    """Dense one-hot encoding of an integer MSA with the gap column removed.
+
+    The resulting axis-2 ordering matches ``mapping.aa_list`` regardless of
+    where the gap sits in ``sym_list``.
+    """
+    onehot = np.eye(num_syms, dtype=bool)[msa]
+    return np.delete(onehot, gapint, axis=-1)
+
+
 def preprocess_msa(
         msa: NDArray[np.int_], 
         seqids: list[str], 
@@ -34,7 +48,7 @@ def preprocess_msa(
         position_gap_thresh: float = 0.2, 
         use_pbar: bool = False,
         verbosity: int = 1, 
-        weight_computation_version: str = "v5",
+        weight_computation_version: str = "sparse",
         block_size: int = 1024
 ):
     """Run preprocessing steps on a given MSA matrix.
@@ -142,7 +156,7 @@ def preprocess_msa(
     }]
 
     # Constuct the boolean MSA matrix
-    xmsa = np.eye(NUM_SYMS, dtype=bool)[msa][:,:,:-1]
+    xmsa = onehot_without_gap(msa, NUM_SYMS, GAP)
     xmsa = xmsa.astype(np.int16)
 
     #~~~ Remove columns (i.e. positions) with too many gaps
@@ -166,7 +180,7 @@ def preprocess_msa(
         "filter_direction": "above",
     })
     logger.info(
-        "Filtered %d positions at threshold τ=%s.",
+        "Filtered %d positions with gap frequency ≥ τ (%s).",
         int(np.sum(~screen)), gap_truncation_thresh,
     )
     logger.info("  MSA shape: %s (sequences x positions)", msa.shape)
@@ -194,7 +208,7 @@ def preprocess_msa(
         "filter_direction": "above",
     })
     logger.info(
-        "Filtered %d sequences at threshold γ_seq=%s.",
+        "Filtered %d sequences with gap frequency ≥ γ_seq (%s).",
         int(np.sum(~screen)), sequence_gap_thresh,
     )
     logger.info("  MSA shape: %s (sequences x positions)", msa.shape)
@@ -234,7 +248,7 @@ def preprocess_msa(
             "filter_direction": "below",
         })
         logger.info(
-            "Filtered %d sequences at threshold Δ=%s.",
+            "Filtered %d sequences with similarity to reference < Δ (%s).",
             int(np.sum(~screen)), reference_similarity_thresh,
         )
         logger.info("  MSA shape: %s (sequences x positions)", msa.shape)
@@ -280,7 +294,7 @@ def preprocess_msa(
         "filter_direction": "above",
     })
     logger.info(
-        "Filtered %d positions at threshold γ_pos=%s.",
+        "Filtered %d positions with weighted gap frequency ≥ γ_pos (%s).",
         int(np.sum(~screen)), position_gap_thresh,
     )
     logger.info("  MSA shape: %s (sequences x positions)", msa.shape)
@@ -335,60 +349,33 @@ def compute_background_freqs(msa_obj, gapstr="-"):
     return background_freqs
 
 
-def compute_weights(version="v1", **kwargs):
-    if version == "v1":
-        return _compute_weights_v1(**kwargs)
-    if version == "v2":
-        return _compute_weights_v2(**kwargs)
-    if version == "v3":
-        return _compute_weights_v3(**kwargs)
-    elif version == "v4":
-        return _compute_weights_v4(**kwargs)
-    elif version == "v5":
-        return _compute_weights_v5(**kwargs)
-    elif version == "v6":
-        return _compute_weights_v6(**kwargs)
+def compute_weights(version="sparse", **kwargs):
+    """Dispatch to a sequence-weight implementation by version string.
+
+    Production methods (exposed via the sca-preprocess CLI):
+      - ``"sparse"``: CPU sparse-CSR dot-product (default).
+      - ``"gpu"``: torch GPU (CUDA/MPS/XPU); falls back to ``"sparse"`` if
+        no accelerator is detected.
+
+    Non-production methods (kept for benchmarking and correctness tests;
+    leading underscore in the version string signals "not intended for
+    routine use"):
+      - ``"_v3"``: naive O(N²) pairwise comparison, blockwise.
+      - ``"_v4"``: sparse dot-product with a dense threshold per row.
+      - ``"_v6"``: JAX-compiled CSR row counting.
+    """
+    if version == "sparse":
+        return _compute_weights_sparse(**kwargs)
     elif version == "gpu":
-        return _compute_weights_torch(**kwargs)
+        return _compute_weights_gpu(**kwargs)
+    elif version == "_v3":
+        return _compute_weights_v3(**kwargs)
+    elif version == "_v4":
+        return _compute_weights_v4(**kwargs)
+    elif version == "_v6":
+        return _compute_weights_v6(**kwargs)
     else:
         raise RuntimeError(f"Weight computation {version} not found")
-
-
-def _compute_weights_v1(**kwargs):
-    raise RuntimeError("BUGGY VERSION OF WEIGHT COMPUTATION")
-    msa = kwargs["msa"]
-    use_pbar = kwargs["use_pbar"]
-    seqsim_thresh = kwargs["seqsim_thresh"]
-    nseqs = msa.shape[0]
-    npos = msa.shape[1]
-    ws = np.nan * np.ones(nseqs)
-    for i, s in tqdm.tqdm(enumerate(msa), total=nseqs, disable=not use_pbar):
-        similarities = np.sum(s == msa, axis=1) / npos
-        screen = similarities >= seqsim_thresh
-        ws[i] = 1 / screen.sum()
-    return ws
-
-
-def _compute_weights_v2(**kwargs):
-    raise RuntimeError("BUGGY VERSION OF WEIGHT COMPUTATION")
-    xmsa = kwargs["xmsa"]
-    block_size = kwargs["block_size"]
-    use_pbar = kwargs["use_pbar"]
-    seqsim_thresh = kwargs["seqsim_thresh"]
-    assert isinstance(xmsa[0,0,0], np.uint16), \
-        f"Expected xmsa to have np.uint16 data. Got {xmsa.dtype}"
-    nseqs = xmsa.shape[0]
-    npos = xmsa.shape[1]
-    nalph = xmsa.shape[2]
-    xmsa = xmsa.reshape([nseqs, -1])
-    ws = np.nan * np.ones(nseqs)
-    for idx1_start, idx1_stop, block1 in iterblocks(xmsa, block_size, use_pbar=use_pbar):
-        block_sims = (xmsa @ block1.T / npos).T
-        assert block_sims.shape == (len(block1), nseqs), \
-            f"Expected {(len(block1), nseqs)}. Got {block_sims.shape}"
-        block_screen = block_sims >= seqsim_thresh
-        ws[idx1_start:idx1_stop] = 1 / block_screen.sum(axis=1)
-    return ws
 
 
 def _compute_weights_v3(**kwargs):
@@ -462,12 +449,12 @@ def _compute_weights_v4(**kwargs):
     return ws
 
 
-def _compute_weights_v5(**kwargs):
-    """
-    Adapted from: 
-        https://github.com/ranganathanlab/pySCA/blob/master/pysca/scaTools.py
+def _compute_weights_sparse(**kwargs):
+    """CPU sparse-CSR sequence-similarity weighting.
 
-    With faster sparse operations directly on data.
+    Adapted from: https://github.com/ranganathanlab/pySCA/blob/master/pysca/scaTools.py
+    with direct iteration over the sparse CSR data buffer to avoid
+    materializing dense similarity blocks.
     """
     msa = kwargs["msa"]
     block_size = kwargs["block_size"]
@@ -564,8 +551,12 @@ def _detect_device():
     return torch.device("cpu")
 
 
-def _compute_weights_torch(**kwargs):
+def _compute_weights_gpu(**kwargs):
+    """GPU-accelerated sequence-similarity weighting via torch.
 
+    Uses the first available torch device (CUDA / MPS / XPU). Falls back
+    to the CPU sparse implementation when no accelerator is detected.
+    """
     msa = kwargs["msa"]
     block_size = kwargs.get("block_size", 512)
     use_pbar = kwargs["use_pbar"]
@@ -580,8 +571,10 @@ def _compute_weights_torch(**kwargs):
 
     device = _detect_device()
     if device == "cpu":
-        logger.warning("No device found. Reverting to version v5!")
-        return _compute_weights_v5(**kwargs)
+        logger.warning(
+            "No GPU device found; falling back to CPU sparse weights."
+        )
+        return _compute_weights_sparse(**kwargs)
 
     # move msa to torch
     msa_t = torch.as_tensor(msa, dtype=torch.int16, device=device)
@@ -622,24 +615,28 @@ def get_onehotmsa_sparse(msa, num_aa, gap):
     Parameters
     ----------
     msa : np.ndarray, shape (Nseq, Npos)
-        Numeric alignment where amino acids are 0..num_aa-1 and num_aa means "other"/gap.
+        Numeric alignment whose entries are integers in [0, num_aa], with
+        exactly one integer (``gap``) reserved for gaps and the remaining
+        ``num_aa`` integers denoting amino-acid states.
     num_aa : int
         Number of amino-acid states (not counting the GAP state).
     gap: int
-        Integer value representing gaps.
+        Integer value representing gaps. May occur at any position in
+        [0, num_aa].
 
     Returns
     -------
     Abin : scipy.sparse.csr_matrix, shape (Nseq, (num_aa + 1) * Npos)
         One-hot encoding (sparse), with gaps encoded as their own symbol.
+        Each (position, symbol) pair maps to a unique column.
     """
     msa = np.asarray(msa)
     if msa.ndim != 2:
         raise ValueError("get_onehotmsa_sparse expects a 2D array (Nseq x Npos).")
-    if gap != num_aa:
-        msg = "get_onehotmsa_sparse expects gap == num_aa."
-        msg += f"Got gap={gap} when num_aas={num_aa}"
-        raise ValueError(msg)
+    if not (0 <= gap <= num_aa):
+        raise ValueError(
+            f"gap must be in [0, num_aa={num_aa}]; got gap={gap}"
+        )
     num_symbols = num_aa + 1  # include gap
     nseqs, npos = msa.shape
     a = msa.astype(np.int8, copy=False).ravel()
@@ -662,34 +659,42 @@ def get_onehotmsa_sparse_nogap(msa, num_aa, gap):
     Parameters
     ----------
     msa : np.ndarray, shape (Nseq, Npos)
-        Numeric alignment where amino acids are 0..num_aa-1 and num_aa means "other"/gap.
+        Numeric alignment whose entries are integers in [0, num_aa], with
+        exactly one integer (``gap``) reserved for gaps and the remaining
+        ``num_aa`` integers denoting amino-acid states.
     num_aa : int
         Number of amino-acid states (not counting the GAP state).
     gap: int
-        Integer value representing gaps.
+        Integer value representing gaps. May occur at any position in
+        [0, num_aa].
 
     Returns
     -------
     Abin : scipy.sparse.csr_matrix, shape (Nseq, num_aa * Npos)
-        One-hot encoding (sparse).
+        One-hot encoding (sparse). The ``num_aa`` columns per position follow
+        the order of the amino-acid symbols with the gap integer excised (i.e.
+        input value ``a`` maps to AA-index ``a`` if ``a < gap`` and
+        ``a - 1`` if ``a > gap``).
     """
     msa = np.asarray(msa)
     if msa.ndim != 2:
         raise ValueError("get_onehotmsa_sparse expects a 2D array (Nseq x Npos).")
-    if gap != num_aa:
-        msg = "get_onehotmsa_sparse expects gap == num_aa."
-        msg += f"Got gap={gap} when num_aas={num_aa}"
-        raise ValueError(msg)
+    if not (0 <= gap <= num_aa):
+        raise ValueError(
+            f"gap must be in [0, num_aa={num_aa}]; got gap={gap}"
+        )
     nseqs, npos = msa.shape
     a = msa.astype(np.int8, copy=False).ravel()
     rows = np.repeat(np.arange(nseqs, dtype=np.uint16), npos)
     pos = np.tile(np.arange(npos, dtype=np.uint16), nseqs)
-    mask = a < num_aa
-    cols = pos[mask] * num_aa + a[mask]
+    mask = a != gap
+    a_masked = a[mask]
+    aa_idx = a_masked - (a_masked > gap).astype(a_masked.dtype)
+    cols = pos[mask] * num_aa + aa_idx
     data = np.ones(cols.shape[0], dtype=np.int16)
 
     onehotmsa = sp.csr_matrix(
-        (data, (rows[mask], cols)), 
+        (data, (rows[mask], cols)),
         shape=(nseqs, num_aa * npos)
     )
     return onehotmsa

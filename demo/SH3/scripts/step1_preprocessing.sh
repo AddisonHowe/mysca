@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-outdir=out
+outdir=out/from_msa
 
 infile=data/msas/SH3_demo_MSA_1.afa
 reference='4837_jgi||3708||Equilibrative'
