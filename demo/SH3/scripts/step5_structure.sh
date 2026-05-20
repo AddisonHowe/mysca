@@ -3,15 +3,16 @@ set -euo pipefail
 
 outdir=out/from_msa
 
-# PDB-level projection: 1SHF (human Fyn SH3 domain, chain A).
-# sca-structure aligns the PDB's primary sequence to the reference MSA
-# (default: mafft --add --keeplength) and then composes with the PDB's
-# residue_ids to produce per-IC lists of PDB residue numbers. 1SHF has
-# residues 84-142, which is a concrete demo of why raw-residue-index
-# != PDB residue number in the general case.
+# PDB-level projection of two SH3 structures in a single batch via
+# --seq_map: 1SHF (human Fyn SH3, residues 84-142) and 2ABL (human
+# Abl1 SH3-SH2 fragment, residues 75-237). sca-structure aligns each
+# PDB's primary sequence to the reference MSA (default: mafft --add
+# --keeplength) and composes with each PDB's residue_ids, producing
+# one per-IC list of PDB residue numbers per structure. Two scaffolds
+# in different residue-numbering frames is a concrete demo of why
+# raw-residue-index != PDB residue number in the general case.
 sca-structure \
-    -s data/pdbs/1SHF.pdb \
-    --chain A \
+    --seq_map data/structures.tsv \
     --preprocessing ${outdir}/preprocessing \
     --scacore ${outdir}/scacore \
     -o ${outdir}/structure

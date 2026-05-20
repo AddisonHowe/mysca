@@ -27,7 +27,12 @@ Per-stage, plots are written into ``{stage_dir}/images/`` by default, or into
                          on or after commit HEAD), plot_sca_spectrum,
                          plot_sca_spectrum_vs_null, plot_dendrogram,
                          plot_t_distributions, plot_data_2d/3d (EV + IC
-                         sweeps), plot_sca_matrix_sector_subset.
+                         sweeps), plot_sca_matrix_sector_subset
+                         (palette controlled by --sector_colors),
+                         plot_seq_projection_2d (requires --preprocessing
+                         for msa_binary3d; optionally colored by
+                         --seq_proj_color_by COLUMN of
+                         sequence_metadata.tsv).
 """
 
 import argparse
@@ -36,6 +41,7 @@ import logging
 import os
 import sys
 
+from mysca.constants import resolve_sector_colors
 from mysca.logging_config import configure_logging
 from mysca.results import PreprocessingResults, SCAResults
 from mysca.pl import (
@@ -54,7 +60,9 @@ from mysca.pl import (
     plot_sca_spectrum,
     plot_sca_spectrum_vs_null,
     plot_sequence_similarity,
+    plot_seq_projection_2d,
     plot_t_distributions,
+    resolve_color_values,
 )
 
 
@@ -110,6 +118,21 @@ def parse_args(args):
         "--imgdir", type=str, default=None, metavar="DIR",
         help="Output directory for all plots. Default: write into each "
         "stage's own 'images/' subdirectory.",
+    )
+    parser.add_argument(
+        "--seq_proj_color_by", type=str, default=None, metavar="COLUMN",
+        help="Color the seq_proj_ic*.png plot by this column of "
+        "sequence_metadata.tsv (loaded from --scacore). Numeric "
+        "columns get a colorbar; categorical columns get a legend.",
+    )
+    parser.add_argument(
+        "--sector_colors", type=str, default="default", metavar="SPEC",
+        help="Sector palette for the sector-subset plot. SPEC accepts: "
+        "'default' (built-in 20-color palette), 'none' (skip "
+        "per-sector coloring), a comma-separated list of hex / named "
+        "colors, a path to a .json or text file, or the name of a "
+        "registered matplotlib colormap (e.g. 'tab10', 'Set1'). "
+        "Default: 'default'.",
     )
     parser.add_argument("-v", "--verbosity", type=int, default=1)
 
@@ -168,7 +191,12 @@ def _replay_preprocessing(stage_dir, imgdir_override):
         )
 
 
-def _replay_scacore(stage_dir, imgdir_override, *, preproc_dir=None):
+def _replay_scacore(
+        stage_dir, imgdir_override, *,
+        preproc_dir=None,
+        seq_proj_color_by=None,
+        sector_colors=None,
+):
     if not os.path.isdir(stage_dir):
         raise FileNotFoundError(f"SCA core directory not found: {stage_dir}")
     sca = SCAResults.load(stage_dir)
@@ -184,14 +212,14 @@ def _replay_scacore(stage_dir, imgdir_override, *, preproc_dir=None):
         plot_conservation(sca.conservation, imgdir)
         prep = _maybe_load_preprocessing(preproc_dir, stage_dir)
         if prep is not None and prep.retained_positions is not None \
-                and prep.msa_obj_orig is not None:
-            num_pos_orig = prep.msa_obj_orig.get_alignment_length()
+                and prep.msa_obj_loaded is not None:
+            num_pos_loaded = prep.msa_obj_loaded.get_alignment_length()
             plot_conservation_top(
-                prep.retained_positions, sca.conservation, num_pos_orig,
+                prep.retained_positions, sca.conservation, num_pos_loaded,
                 imgdir,
             )
             plot_conservation_positional(
-                prep.retained_positions, sca.conservation, num_pos_orig,
+                prep.retained_positions, sca.conservation, num_pos_loaded,
                 imgdir,
             )
         else:
@@ -278,15 +306,56 @@ def _replay_scacore(stage_dir, imgdir_override, *, preproc_dir=None):
         )
 
     if sca.sca_matrix_sector_subset is not None:
-        from mysca.constants import SECTOR_COLORS
         plot_sca_matrix_sector_subset(
             sca.sca_matrix_sector_subset, sca.ic_positions,
-            SECTOR_COLORS, imgdir,
+            sector_colors, imgdir,
         )
     else:
         logger.warning(
             "No sca_matrix_sector_subset in %s; skipping sector-subset plot.",
             stage_dir,
+        )
+
+    prep = _maybe_load_preprocessing(preproc_dir, stage_dir)
+    if prep is not None and prep.msa_binary3d is not None:
+        try:
+            up_seq = sca.project_sequences(prep.msa_binary3d)
+        except RuntimeError as e:
+            logger.warning(
+                "Cannot compute sequence projection in %s: %s", stage_dir, e,
+            )
+        else:
+            color_values = None
+            color_label = None
+            if seq_proj_color_by is not None:
+                if sca.sequence_metadata is None:
+                    logger.warning(
+                        "--seq_proj_color_by=%r ignored: %s has no "
+                        "sequence_metadata.tsv.",
+                        seq_proj_color_by, stage_dir,
+                    )
+                elif seq_proj_color_by not in sca.sequence_metadata.columns:
+                    logger.warning(
+                        "--seq_proj_color_by=%r ignored: column missing. "
+                        "Available: %s",
+                        seq_proj_color_by,
+                        list(sca.sequence_metadata.columns),
+                    )
+                else:
+                    color_values = resolve_color_values(
+                        sca.sequence_metadata,
+                        list(prep.retained_sequence_ids),
+                        seq_proj_color_by,
+                    )
+                    color_label = seq_proj_color_by
+            plot_seq_projection_2d(
+                up_seq, (0, 1), imgdir,
+                color_values=color_values, color_label=color_label,
+            )
+    else:
+        logger.warning(
+            "Preprocessing dir not resolved or msa_binary3d missing; "
+            "skipping seq_proj_ic*.png (needs PreprocessingResults.msa_binary3d).",
         )
 
 
@@ -317,8 +386,11 @@ def main(args):
     if args.preprocessing:
         _replay_preprocessing(args.preprocessing, args.imgdir)
     if args.scacore:
+        sector_colors = resolve_sector_colors(args.sector_colors)
         _replay_scacore(
             args.scacore, args.imgdir, preproc_dir=args.preprocessing,
+            seq_proj_color_by=args.seq_proj_color_by,
+            sector_colors=sector_colors,
         )
 
     logger.info("sca-plots done.")

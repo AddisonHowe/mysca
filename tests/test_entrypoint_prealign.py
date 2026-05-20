@@ -21,9 +21,11 @@ INPUT_FASTA = f"{DATDIR}/seqs/seqs07.fasta"
 _MAFFT = shutil.which("mafft") is not None
 _MMSEQS = shutil.which("mmseqs") is not None
 _CLUSTALO = shutil.which("clustalo") is not None
+_FAMSA = shutil.which("famsa") is not None
 needs_mafft = pytest.mark.skipif(not _MAFFT, reason="mafft not on PATH")
 needs_mmseqs = pytest.mark.skipif(not _MMSEQS, reason="mmseqs not on PATH")
 needs_clustalo = pytest.mark.skipif(not _CLUSTALO, reason="clustalo not on PATH")
+needs_famsa = pytest.mark.skipif(not _FAMSA, reason="famsa not on PATH")
 
 
 def _aligned_lengths(fpath):
@@ -340,6 +342,174 @@ def test_align_clustalo_missing_binary_fails_fast():
         "-v", "0",
     ])
     with pytest.raises(FileNotFoundError):
+        main(args)
+    remove_dir(outdir)
+
+
+@needs_famsa
+def test_align_only_famsa():
+    outdir = f"{TMPDIR}/prealign_align_only_famsa"
+    if os.path.isdir(outdir):
+        remove_dir(outdir)
+    args = parse_args([
+        "-i", INPUT_FASTA,
+        "-o", outdir,
+        "--align", "famsa",
+        "-v", "0",
+    ])
+    main(args)
+
+    aligned = os.path.join(outdir, "aligned.fasta")
+    assert os.path.isfile(aligned)
+    lengths = _aligned_lengths(aligned)
+    assert len(lengths) == 1, f"Non-uniform aligned lengths: {lengths}"
+    # Wrapper always passes -keep_duplicates, so record count must be preserved.
+    assert _record_count(aligned) == _record_count(INPUT_FASTA)
+
+    args_path = os.path.join(outdir, "prealign_args.json")
+    assert os.path.isfile(args_path)
+    import json
+    with open(args_path) as f:
+        persisted = json.load(f)
+    assert persisted["align"] == "famsa"
+
+    remove_dir(outdir)
+
+
+@needs_famsa
+def test_align_famsa_stockholm_output():
+    outdir = f"{TMPDIR}/prealign_famsa_sto_out"
+    if os.path.isdir(outdir):
+        remove_dir(outdir)
+    args = parse_args([
+        "-i", INPUT_FASTA,
+        "-o", outdir,
+        "--align", "famsa",
+        "--output_format", "stockholm",
+        "-v", "0",
+    ])
+    main(args)
+
+    aligned = os.path.join(outdir, "aligned.sto")
+    assert os.path.isfile(aligned)
+    assert not os.path.isfile(os.path.join(outdir, "aligned.fasta"))
+
+    with open(aligned) as f:
+        aln = AlignIO.read(f, "stockholm")
+    assert len(aln) == _record_count(INPUT_FASTA)
+    assert len({len(rec.seq) for rec in aln}) == 1
+
+    remove_dir(outdir)
+
+
+@needs_famsa
+def test_align_famsa_guidetree_out():
+    outdir = f"{TMPDIR}/prealign_famsa_guidetree"
+    if os.path.isdir(outdir):
+        remove_dir(outdir)
+    args = parse_args([
+        "-i", INPUT_FASTA,
+        "-o", outdir,
+        "--align", "famsa",
+        "--align_args", "guidetree_out=true",
+        "-v", "0",
+    ])
+    main(args)
+
+    guidetree = os.path.join(outdir, "guidetree.dnd")
+    assert os.path.isfile(guidetree)
+    assert os.path.getsize(guidetree) > 0
+
+    remove_dir(outdir)
+
+
+@needs_famsa
+def test_align_famsa_gt_upgma():
+    outdir = f"{TMPDIR}/prealign_famsa_gt_upgma"
+    if os.path.isdir(outdir):
+        remove_dir(outdir)
+    args = parse_args([
+        "-i", INPUT_FASTA,
+        "-o", outdir,
+        "--align", "famsa",
+        "--align_args", "gt=upgma",
+        "-v", "0",
+    ])
+    main(args)
+
+    aligned = os.path.join(outdir, "aligned.fasta")
+    assert os.path.isfile(aligned)
+    lengths = _aligned_lengths(aligned)
+    assert len(lengths) == 1, f"Non-uniform aligned lengths: {lengths}"
+    assert _record_count(aligned) == _record_count(INPUT_FASTA)
+
+    remove_dir(outdir)
+
+
+@needs_famsa
+def test_famsa_chain_to_preprocess():
+    prealign_outdir = f"{TMPDIR}/prealign_famsa_chain"
+    preprocess_outdir = f"{TMPDIR}/prealign_famsa_chain_preprocess"
+    for d in (prealign_outdir, preprocess_outdir):
+        if os.path.isdir(d):
+            remove_dir(d)
+
+    main(parse_args([
+        "-i", INPUT_FASTA,
+        "-o", prealign_outdir,
+        "--align", "famsa",
+        "-v", "0",
+    ]))
+    aligned = os.path.join(prealign_outdir, "aligned.fasta")
+    assert os.path.isfile(aligned)
+
+    pp_args = run_preprocessing_mod.parse_args([
+        "-i", aligned,
+        "-o", preprocess_outdir,
+        "-v", "0",
+    ])
+    run_preprocessing_mod.main(pp_args)
+
+    assert os.path.isfile(
+        os.path.join(preprocess_outdir, "preprocessing_results.npz")
+    )
+
+    remove_dir(prealign_outdir)
+    remove_dir(preprocess_outdir)
+
+
+def test_align_famsa_missing_binary_fails_fast():
+    """Aligner-aware _resolve_bin must look up famsa, not mafft."""
+    outdir = f"{TMPDIR}/prealign_famsa_missing_bin"
+    if os.path.isdir(outdir):
+        remove_dir(outdir)
+    args = parse_args([
+        "-i", INPUT_FASTA,
+        "-o", outdir,
+        "--align", "famsa",
+        "--align_bin", "/nonexistent/famsa",
+        "-v", "0",
+    ])
+    with pytest.raises(FileNotFoundError):
+        main(args)
+    remove_dir(outdir)
+
+
+def test_align_famsa_unknown_align_args_key_rejected():
+    """Unknown --align_args keys for famsa raise ValueError from the wrapper.
+    Uses a nonexistent --align_bin so this test runs without famsa on PATH."""
+    outdir = f"{TMPDIR}/prealign_famsa_unknown_key"
+    if os.path.isdir(outdir):
+        remove_dir(outdir)
+    args = parse_args([
+        "-i", INPUT_FASTA,
+        "-o", outdir,
+        "--align", "famsa",
+        "--align_bin", "/nonexistent/famsa",
+        "--align_args", "bogus=true",
+        "-v", "0",
+    ])
+    with pytest.raises((FileNotFoundError, ValueError)):
         main(args)
     remove_dir(outdir)
 

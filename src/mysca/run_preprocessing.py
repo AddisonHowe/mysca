@@ -7,6 +7,20 @@ an output directory with the preprocessed results. See references:
 -------------------------------------------------------------------------------
 COMMAND LINE ARGUMENTS:
 
+Optional:
+    --accelerator            Global accelerator preference, one of
+        {none, gpu}. Default 'none'. When 'gpu', --weight_method
+        auto-defaults to 'gpu' (torch CUDA/MPS/XPU; falls back to
+        'sparse' if no accelerator is detected). An explicit
+        --weight_method overrides this preference.
+    --weight_method          {sparse, gpu}. When unset, resolved via
+        --accelerator. Default-with-accelerator-none: 'sparse' (CPU
+        sparse-CSR). Default-with-accelerator-gpu: 'gpu'.
+    --block_size             Row-block size for the pairwise sequence-
+        similarity computation inside `weight_method='sparse'`. Default
+        512. Smaller blocks cap peak memory; larger blocks amortize
+        per-block overhead.
+
 SCA parameters (see [1] for definitions):
     --gap_truncation_thresh   (τ; default 0.4) Remove columns with gap
         frequency above this threshold, applied before any sequence-level
@@ -37,6 +51,11 @@ preprocessing_results.npz
     retained_sequence_ids : IDs of retained sequences in the original MSA.
     sequence_weights : Sampling weights for the retained sequences.
     fi0_pretruncation : Gap frequency per position, prior to truncation.
+    seq_retained_fraction : Per-input-sequence fraction of non-gap residues
+        that survived column filtering. 1D float array of length M_input,
+        indexed by the post-load_msa input order (parallel to the original
+        MSA, NOT the retained subset). NaN where an input row has zero
+        non-gap residues.
 
 msa_binary2d_sp.npz
     MSA in a 2-dimensional sparse one-hot format of shape (M x DL), with D
@@ -55,8 +74,12 @@ msa_orig.fasta-aln
 filter_history.json
     Per-stage filter diagnostics (counts + threshold + stat distribution).
     Always persisted so `sca-plots` can replay the diagnostic plots later.
+    When `load_msa` performs pre-preprocessing drops, the corresponding
+    stages (``internal_stop_codon``, ``excluded_symbols``) appear at the
+    head of the list. Trailing stop codons (``*``) are silently replaced
+    with gap inside ``load_msa`` and do not produce their own stage.
 
-images/ (only when --plot is passed)
+images/ (default: on; pass --no-plot to skip)
     filter_history.png, filter_distributions.png.
 
 -------------------------------------------------------------------------------
@@ -83,6 +106,7 @@ from mysca.logging_config import configure_logging
 from mysca.mappings import SymMap
 from mysca.constants import AA_STD20
 from mysca.preprocess import preprocess_msa
+from mysca._acceleration import ACCELERATOR_CHOICES, resolve_method
 from mysca.pl import plot_filter_history, plot_filter_distributions
 from mysca.results import (
     PreprocessingResults,
@@ -107,9 +131,12 @@ def parse_args(args):
                         help="Verbosity level (0=warnings only).")
     parser.add_argument("--pbar", action="store_true",
                         help="Enable tqdm progress bars.")
-    parser.add_argument("--plot", action="store_true",
-                        help="Emit filter_history.png and "
-                        "filter_distributions.png to outdir/images/.")
+    parser.add_argument(
+        "--plot", default=True, action=argparse.BooleanOptionalAction,
+        help="Emit filter_history.png and filter_distributions.png to "
+             "outdir/images/. Default: on. Pass --no-plot to skip plot "
+             "generation entirely (no images/ directory is created).",
+    )
 
     parser.add_argument(
         "--input_format", type=str, default="fasta",
@@ -134,14 +161,24 @@ def parse_args(args):
         "(legacy behavior).",
     )
     parser.add_argument(
-        "--weight_method", type=str, default="sparse",
+        "--accelerator", type=str, default="none",
+        choices=list(ACCELERATOR_CHOICES),
+        help="Global accelerator preference. 'none' (default) keeps "
+        "the CPU-default kernels. 'gpu' flips per-step kernel "
+        "defaults to their GPU variants where available "
+        "(currently: --weight_method auto-selects 'gpu'). An "
+        "explicit --weight_method overrides this preference.",
+    )
+    parser.add_argument(
+        "--weight_method", type=str, default=None,
         choices=["sparse", "gpu"],
-        help="Sequence-weight computation backend. 'sparse' (default) "
-        "uses a CPU sparse-CSR implementation; 'gpu' dispatches to torch "
-        "(CUDA/MPS/XPU), falling back to 'sparse' if no accelerator is "
-        "detected. Non-production benchmark variants ('_v3', '_v4', "
-        "'_v6') remain callable via the preprocess_msa library API but "
-        "are intentionally not exposed here.",
+        help="Sequence-weight computation backend. When unset, "
+        "resolves via --accelerator: 'none' -> 'sparse' (CPU "
+        "sparse-CSR), 'gpu' -> 'gpu' (torch CUDA/MPS/XPU; falls back "
+        "to 'sparse' if no accelerator is detected). Non-production "
+        "benchmark variants ('_v3', '_v4', '_v6') remain callable via "
+        "the preprocess_msa library API but are intentionally not "
+        "exposed here.",
     )
     parser.add_argument(
         "--block_size", type=int, default=512,
@@ -192,7 +229,15 @@ def main(args):
     verbosity = args.verbosity
     pbar = args.pbar
     do_plot = args.plot
-    weight_computation_version = args.weight_method
+    accelerator = args.accelerator
+    # Resolve --weight_method / --accelerator. Explicit --weight_method
+    # wins; else --accelerator gpu routes to 'gpu'; else 'sparse'.
+    weight_computation_version = resolve_method(
+        method=args.weight_method,
+        accelerator=accelerator,
+        cpu_default="sparse",
+        gpu_choice="gpu",
+    )
     block_size = args.block_size
     
     syms = args.syms
@@ -238,20 +283,21 @@ def main(args):
 
     # Load MSA
     logger.info("Loading MSA (%s) from: %s", args.input_format, msa_fpath)
-    msa_obj_orig, msa_orig, seqids_orig, sym_map = load_msa(
+    (msa_obj_loaded, msa_loaded, seqids_loaded, descriptions_loaded,
+     sym_map, n_excluded, n_internal_stop) = load_msa(
         msa_fpath, format=args.input_format,
         mapping=sym_map,
     )
-    num_seq_orig, num_pos_orig = msa_orig.shape
+    num_seq_loaded, num_pos_loaded = msa_loaded.shape
 
     logger.info(
-        "Loaded MSA. shape: %s (sequences x positions)", msa_orig.shape
+        "Loaded MSA. shape: %s (sequences x positions)", msa_loaded.shape
     )
     logger.info("Symbols: %s", sym_map.aa_list)
 
     # Run preprocessing script
     msa, preprocessing_results = preprocess_msa(
-        msa_orig, seqids_orig,
+        msa_loaded, seqids_loaded,
         mapping=sym_map,
         gap_truncation_thresh=gap_truncation_thresh,
         sequence_gap_thresh=sequence_gap_thresh,
@@ -263,13 +309,24 @@ def main(args):
         verbosity=verbosity,
         weight_computation_version=weight_computation_version,
         block_size=block_size,
+        n_excluded_pre_load=n_excluded,
+        n_internal_stop_pre_load=n_internal_stop,
+        seq_descriptions=descriptions_loaded,
     )
 
     results = PreprocessingResults.from_preprocess_output(
         msa, preprocessing_results,
         sym_map=sym_map,
-        msa_obj_orig=msa_obj_orig,
+        msa_obj_loaded=msa_obj_loaded,
     )
+    # Persist weight_method (resolved) and accelerator (raw) into the
+    # args bundle for run-replay parity. Both are CLI-layer concerns and
+    # don't belong in preprocess_msa's signature.
+    results.args = {
+        **(results.args or {}),
+        "weight_method": weight_computation_version,
+        "accelerator": accelerator,
+    }
     results.save(outdir)
 
     if do_plot:

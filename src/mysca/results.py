@@ -84,7 +84,9 @@ SCARUN_ARGS_FNAME = "scarun_args.json"
 SCARUN_EIGENDECOMP_FNAME = "sca_eigendecomp.npz"
 IC_RESIDUES_PER_SEQ_FNAME = "ic_residues_per_seq.npz"
 IC_LOADINGS_PER_SEQ_FNAME = "ic_loadings_per_seq.npz"
+COMPONENT_COVERAGE_PER_SEQ_FNAME = "component_coverage_per_seq.npz"
 EVALS_SHUFF_FNAME = "evals_shuff.npy"
+SEQUENCE_METADATA_FNAME = "sequence_metadata.tsv"
 
 
 def _describe_value(val):
@@ -135,12 +137,26 @@ class PreprocessingResults:
 
     On-disk format (usable without mysca):
         preprocessing_results.npz
-            msa                   : int array (M x L), processed MSA
-            retained_sequences    : int array, indices into original MSA rows
-            retained_positions    : int array, indices into original MSA columns
-            retained_sequence_ids : str array, IDs of retained sequences
-            sequence_weights      : float array (M,)
-            fi0_pretruncation     : float array, gap freq before truncation
+            msa                            : int array (M x L), processed MSA
+            retained_sequences             : int array, indices into original MSA rows
+            retained_positions             : int array, indices into original MSA columns
+            retained_sequence_ids          : str array, IDs of retained sequences
+            retained_sequence_descriptions : str array (optional, may be
+                                             absent from legacy bundles), parallel
+                                             to retained_sequence_ids; carries the
+                                             trailing FASTA header description for
+                                             each retained sequence
+            sequence_weights               : float array (M,)
+            fi0_pretruncation              : float array, gap freq before truncation
+            seq_retained_fraction          : float array (optional, may be
+                                             absent from legacy bundles), length
+                                             M_input. Per-input-sequence fraction
+                                             of non-gap residues that survived
+                                             column filtering. Indexed by the
+                                             post-load_msa input order (parallel
+                                             to msa_obj_loaded), NOT the retained
+                                             subset; NaN when a row has zero
+                                             non-gap residues.
         preprocessing_args.json   : dict of preprocessing parameters
         sym2int.json              : dict mapping symbols to integers
         msa_binary2d_sp.npz       : sparse CSR (M x 20L), one-hot MSA
@@ -175,6 +191,13 @@ class PreprocessingResults:
             "IDs (strings) of retained sequences, aligned to "
             "retained_sequences. Preserves input order."
         ),
+        "retained_sequence_descriptions": (
+            "Trailing FASTA header descriptions (everything after the "
+            "first whitespace in each header), parallel to "
+            "retained_sequence_ids. Empty string when a header has no "
+            "trailing description. May be None for legacy bundles "
+            "that pre-date description preservation."
+        ),
         "sequence_weights": (
             "Sampling weights per retained sequence (1D float array of "
             "length M). Used throughout SCA for weighted frequencies."
@@ -182,6 +205,14 @@ class PreprocessingResults:
         "fi0_pretruncation": (
             "Per-position gap frequency before the first truncation step "
             "(1D float array, length = original alignment length)."
+        ),
+        "seq_retained_fraction": (
+            "Per-input-sequence fraction of non-gap residues that survived "
+            "column filtering: kept_AAs / total_non_gap_AAs_in_input. 1D "
+            "float array of length M_input, indexed by the post-load_msa "
+            "input order (parallel to msa_obj_loaded), NOT the retained "
+            "subset. NaN when a row has zero non-gap residues. May be None "
+            "for legacy bundles that pre-date this field."
         ),
         "args": (
             "Dict of CLI arguments used to produce this result, for "
@@ -191,14 +222,15 @@ class PreprocessingResults:
             "SymMap instance: the alphabet and gap symbol used. Integer "
             "encoding of every symbol is stable across save/load."
         ),
-        "msa_obj_orig": (
+        "msa_obj_loaded": (
             "Original MSA as a Biopython MultipleSeqAlignment (before any "
             "filtering). Needed for raw-residue coordinate mapping."
         ),
         "filter_history": (
             "List of per-stage filter diagnostics (counts, threshold, and "
             "the statistic distribution that fed the filter). Consumed "
-            "by sca-plots for filter-diagnostic figures."
+            "by sca-plots for filter-diagnostic figures. May be None for "
+            "legacy bundles that pre-date the filter-history persistence."
         ),
     }
 
@@ -224,19 +256,23 @@ class PreprocessingResults:
         fi0_pretruncation,
         args,
         sym_map=None,
-        msa_obj_orig=None,
+        msa_obj_loaded=None,
         filter_history=None,
+        retained_sequence_descriptions=None,
+        seq_retained_fraction=None,
     ):
         self.msa = msa
         self.msa_binary3d = msa_binary3d
         self.retained_sequences = retained_sequences
         self.retained_positions = retained_positions
         self.retained_sequence_ids = retained_sequence_ids
+        self.retained_sequence_descriptions = retained_sequence_descriptions
         self.sequence_weights = sequence_weights
         self.fi0_pretruncation = fi0_pretruncation
+        self.seq_retained_fraction = seq_retained_fraction
         self.args = args
         self.sym_map = sym_map
-        self.msa_obj_orig = msa_obj_orig
+        self.msa_obj_loaded = msa_obj_loaded
         self.filter_history = filter_history
 
     @property
@@ -249,7 +285,7 @@ class PreprocessingResults:
 
     @classmethod
     def from_preprocess_output(cls, msa, results_dict, sym_map=None,
-                               msa_obj_orig=None):
+                               msa_obj_loaded=None):
         """Construct from the (msa, results_dict) returned by preprocess_msa().
         """
         return cls(
@@ -262,22 +298,37 @@ class PreprocessingResults:
             fi0_pretruncation=results_dict["fi0_pretruncation"],
             args=results_dict["args"],
             sym_map=sym_map,
-            msa_obj_orig=msa_obj_orig,
+            msa_obj_loaded=msa_obj_loaded,
             filter_history=results_dict.get("filter_history"),
+            retained_sequence_descriptions=results_dict.get(
+                "retained_sequence_descriptions",
+            ),
+            seq_retained_fraction=results_dict.get("seq_retained_fraction"),
         )
 
     def save(self, outdir):
         """Save all results to the given directory."""
         os.makedirs(outdir, exist_ok=True)
 
-        np.savez(
-            os.path.join(outdir, PREPROCESSING_RESULTS_FNAME),
+        npz_kwargs = dict(
             msa=self.msa,
             retained_sequences=self.retained_sequences,
             retained_positions=self.retained_positions,
             retained_sequence_ids=self.retained_sequence_ids,
             sequence_weights=self.sequence_weights,
             fi0_pretruncation=self.fi0_pretruncation,
+        )
+        if self.retained_sequence_descriptions is not None:
+            npz_kwargs["retained_sequence_descriptions"] = np.asarray(
+                self.retained_sequence_descriptions, dtype=object,
+            )
+        if self.seq_retained_fraction is not None:
+            npz_kwargs["seq_retained_fraction"] = np.asarray(
+                self.seq_retained_fraction, dtype=np.float64,
+            )
+        np.savez(
+            os.path.join(outdir, PREPROCESSING_RESULTS_FNAME),
+            **npz_kwargs,
         )
 
         with open(os.path.join(outdir, PREPROCESSING_ARGS_FNAME), "w") as f:
@@ -300,10 +351,10 @@ class PreprocessingResults:
                 ),
             )
 
-        if self.msa_obj_orig is not None:
+        if self.msa_obj_loaded is not None:
             from Bio import AlignIO
             AlignIO.write(
-                self.msa_obj_orig,
+                self.msa_obj_loaded,
                 os.path.join(outdir, PREPROCESSING_MSAORIG_FNAME),
                 format="fasta",
             )
@@ -327,6 +378,16 @@ class PreprocessingResults:
         retained_sequence_ids = data["retained_sequence_ids"]
         sequence_weights = data["sequence_weights"]
         fi0_pretruncation = data["fi0_pretruncation"]
+        retained_sequence_descriptions = (
+            list(data["retained_sequence_descriptions"])
+            if "retained_sequence_descriptions" in data.files
+            else None
+        )
+        seq_retained_fraction = (
+            np.asarray(data["seq_retained_fraction"], dtype=np.float64)
+            if "seq_retained_fraction" in data.files
+            else None
+        )
 
         # Load args
         args_path = os.path.join(dirpath, PREPROCESSING_ARGS_FNAME)
@@ -356,12 +417,12 @@ class PreprocessingResults:
             )
 
         # Try to load original MSA (requires Biopython)
-        msa_obj_orig = None
+        msa_obj_loaded = None
         orig_path = os.path.join(dirpath, PREPROCESSING_MSAORIG_FNAME)
         if os.path.isfile(orig_path):
             try:
                 from Bio import AlignIO
-                msa_obj_orig = AlignIO.read(orig_path, "fasta")
+                msa_obj_loaded = AlignIO.read(orig_path, "fasta")
             except ImportError:
                 pass
 
@@ -382,8 +443,10 @@ class PreprocessingResults:
             fi0_pretruncation=fi0_pretruncation,
             args=args,
             sym_map=sym_map,
-            msa_obj_orig=msa_obj_orig,
+            msa_obj_loaded=msa_obj_loaded,
             filter_history=filter_history,
+            retained_sequence_descriptions=retained_sequence_descriptions,
+            seq_retained_fraction=seq_retained_fraction,
         )
 
 
@@ -393,6 +456,14 @@ class SCAResults:
     Per-field descriptions are available at class level as
     ``SCAResults.FIELD_DESCRIPTIONS`` and can be rendered for any instance
     via ``results.info()``.
+
+    Sequence-space projection:
+        :meth:`project_sequences` maps one-hot sequences (M x L_proc x D)
+        onto the IC coordinate system (Uᵖ, M x n_components) on demand,
+        following Rivoire et al. (2016) Eqs. 14–15 with per-position P̃
+        normalization. No new on-disk fields are required — the operands
+        (``phi_ia``, ``fia``, ``significant_evecs_sca``,
+        ``significant_evals_sca``, ``w_ica``) are already persisted below.
 
     On-disk format (usable without mysca):
         scarun_results.npz
@@ -410,6 +481,15 @@ class SCAResults:
                                         coordinates, keyed `ic_<i>_<seqid>`
         ic_loadings_per_seq.npz       : per-residue IC loadings parallel to
                                         ic_residues_per_seq, same key format
+        component_coverage_per_seq.npz: per-sequence IC coverage fractions,
+                                        keyed by `seq_id`. Each value is a
+                                        1D float array of length
+                                        n_components: fraction of IC i's
+                                        high-load positions where the
+                                        sequence has a non-gap residue.
+                                        NaN for ICs with empty position
+                                        sets. Populated for sequences
+                                        selected by `--coverage_for`.
         ic_positions/
             ic_<i>_msaproc.npy        : high-load processed-MSA cols of IC i
             ic_<i>_msaorig.npy        : same positions in original-MSA cols
@@ -425,6 +505,21 @@ class SCAResults:
             t_dists_info.json         : t-distribution fit parameters
             evals_shuff.npy           : bootstrap eigenvalues
             sca_matrix_sector_subset.npy
+
+        Conditional outputs:
+        seq_projections.tsv (only with --save_dataframe)
+            Per-retained-sequence Uᵖ table. Columns: `seq_id`,
+            `aligned_sequence`, `Up_0` ... `Up_{n_components-1}`, plus
+            any columns merged in from `sequence_metadata`.
+        sequence_metadata.tsv (only with --seq_metadata)
+            Verbatim copy of the user-supplied per-sequence metadata
+            TSV. Carries a `seq_id` column plus arbitrary user columns
+            (e.g. taxid, kingdom, phylum); merged into
+            `seq_projections.tsv` via left-join on `seq_id` when
+            `--save_dataframe` is also set.
+        images/ (only with --plot, the default)
+            Diagnostic plots (conservation, SCA matrix, spectrum, IC
+            scatters, sector subset, sequence-projection scatter, etc.).
     """
 
     FIELD_DESCRIPTIONS = {
@@ -534,15 +629,33 @@ class SCAResults:
             "`ic_loadings_per_seq[ic_{i}_{seqid}]` is the IC i loading "
             "at the residue `ic_residues_per_seq[ic_{i}_{seqid}][j]`."
         ),
+        "component_coverage_per_seq": (
+            "Per-sequence IC coverage fractions, keyed by sequence id. "
+            "Each value is a 1D float array of length n_components: "
+            "fraction of IC i's high-load positions where the input "
+            "sequence has a non-gap residue (computed against the "
+            "original-MSA columns via retained_positions). Populated "
+            "for sequences selected by `--coverage_for` and includes "
+            "sequences dropped during preprocessing. NaN for ICs with "
+            "empty position sets."
+        ),
         "sca_matrix_sector_subset": (
             "Submatrix of `sca_matrix` restricted to all group positions "
             "(concatenated). Shape (sum_i len(groups[i])) squared."
+        ),
+        "sequence_metadata": (
+            "Optional pandas DataFrame with a `seq_id` column plus any "
+            "number of user-supplied columns (e.g. taxid, kingdom, "
+            "phylum). Loaded from `--seq_metadata <tsv>` at sca-core "
+            "invocation; persisted as `sequence_metadata.tsv`. None "
+            "when no metadata was supplied."
         ),
         # Args
         "args": (
             "Dict of CLI arguments used for this run (regularization, "
             "kstar, n_components, pstar, assignment, seed, n_boot, "
-            "n_logged_comps)."
+            "n_logged_comps, plot, freq_method, accelerator, precision, "
+            "bootstrap_chunk, sectors_for, coverage_for)."
         ),
     }
 
@@ -590,7 +703,9 @@ class SCAResults:
         t_dists_info=None,
         ic_residues_per_seq=None,
         ic_loadings_per_seq=None,
+        component_coverage_per_seq=None,
         sca_matrix_sector_subset=None,
+        sequence_metadata=None,
         # Args
         args=None,
     ):
@@ -619,7 +734,9 @@ class SCAResults:
         self.t_dists_info = t_dists_info
         self.ic_residues_per_seq = ic_residues_per_seq
         self.ic_loadings_per_seq = ic_loadings_per_seq
+        self.component_coverage_per_seq = component_coverage_per_seq
         self.sca_matrix_sector_subset = sca_matrix_sector_subset
+        self.sequence_metadata = sequence_metadata
         self.args = args
 
     @property
@@ -633,6 +750,107 @@ class SCAResults:
         if self.conservation is not None:
             return len(self.conservation)
         return None
+
+    def _require_fields(self, *names):
+        missing = [n for n in names if getattr(self, n, None) is None]
+        if missing:
+            raise RuntimeError(
+                f"{type(self).__name__} is missing required fields "
+                f"{missing} (got None). Was this loaded from a partial run?"
+            )
+
+    def project_sequences(self, xmsa):
+        """Project one-hot sequences onto IC coordinates (Uᵖ).
+
+        Implements the Rivoire et al. (2016) sequence-position mapping
+        (Eqs. 14, 15) with per-position P̃ normalization (Box 1, p. 6):
+
+            P̃[i,a] = φ_ia · f_ia / sqrt(Σ_b (φ_ib · f_ib)²)
+            xsi[m,i] = Σ_a P̃[i,a] · xmsa[m,i,a]
+            Ũ        = xsi · V̌ · diag(λ̃^-½)
+            Uᵖ       = Ũ · Wᵀ
+
+        Requires `phi_ia`, `fia`, `evecs_sca`, `evals_sca`, and `w_ica`
+        to be present on this instance. Uses the first ``w_ica.shape[0]``
+        eigenmodes (== `n_components`, the dimension ICA was run on),
+        which may exceed `kstar` when sca-core was invoked with
+        ``--n_components`` greater than the bootstrap-significant count.
+
+        Parameters
+        ----------
+        xmsa : array-like, shape (M, L_proc, D)
+            One-hot encoded sequences in processed-MSA coordinates. Gaps
+            are all-zero rows (matches `PreprocessingResults.msa_binary3d`
+            and the output of `mysca.preprocess.onehot_without_gap`).
+
+        Returns
+        -------
+        up : np.ndarray, shape (M, n_components), float64
+            Sequence-space IC scores Uᵖ.
+        """
+        self._require_fields(
+            "phi_ia", "fia", "evecs_sca", "evals_sca", "w_ica",
+        )
+        L, D = self.fia.shape
+        xmsa = np.asarray(xmsa)
+        if xmsa.ndim != 3 or xmsa.shape[1:] != (L, D):
+            raise ValueError(
+                f"xmsa has shape {xmsa.shape}; expected (M, {L}, {D}) to "
+                f"match this SCAResults' fia dimensions."
+            )
+        n_comp = self.w_ica.shape[0]
+        evecs = self.evecs_sca[:, :n_comp]
+        evals = self.evals_sca[:n_comp]
+        pf = self.phi_ia * self.fia
+        denom = np.sqrt(np.sum(pf * pf, axis=-1, keepdims=True))
+        pia = pf / denom
+        xf = xmsa.astype(np.float64, copy=False)
+        xsi = np.einsum("ia,mia->mi", pia, xf)
+        utilde = (xsi @ evecs) / np.sqrt(evals)
+        return utilde @ self.w_ica.T
+
+    def to_dataframe(self, prep):
+        """In-sample sequence DataFrame keyed by retained_sequence_ids.
+
+        Columns: ``seq_id``, ``aligned_sequence`` (length L_orig, the
+        original-MSA-coordinate sequence from msa_obj_loaded),
+        ``Up_0``, ``Up_1``, ..., ``Up_{n_components-1}`` (Uᵖ row from
+        ``project_sequences(prep.msa_binary3d)``). When
+        ``sequence_metadata`` is populated on this instance, its
+        non-``seq_id`` columns are merged in via left-join on
+        ``seq_id``.
+
+        Requires pandas installed and a PreprocessingResults instance
+        with ``msa_obj_loaded``, ``retained_sequence_ids``,
+        ``retained_sequences``, and ``msa_binary3d`` populated.
+        """
+        import pandas as pd
+        if prep.msa_obj_loaded is None:
+            raise RuntimeError(
+                "to_dataframe requires PreprocessingResults.msa_obj_loaded; "
+                "the source preprocessing run did not persist msa_orig.fasta-aln."
+            )
+        if prep.msa_binary3d is None:
+            raise RuntimeError(
+                "to_dataframe requires PreprocessingResults.msa_binary3d "
+                "(persisted as msa_binary2d_sp.npz)."
+            )
+        up = self.project_sequences(prep.msa_binary3d)
+        ids_to_row = {rec.id: i for i, rec in enumerate(prep.msa_obj_loaded)}
+        rows = []
+        for i, sid in enumerate(prep.retained_sequence_ids):
+            rec = prep.msa_obj_loaded[ids_to_row[sid]]
+            row = {
+                "seq_id": sid,
+                "aligned_sequence": str(rec.seq),
+            }
+            for k, v in enumerate(up[i]):
+                row[f"Up_{k}"] = float(v)
+            rows.append(row)
+        df = pd.DataFrame(rows)
+        if self.sequence_metadata is not None:
+            df = df.merge(self.sequence_metadata, on="seq_id", how="left")
+        return df
 
     @classmethod
     def from_core_output(cls, sca_results_dict, args=None):
@@ -820,6 +1038,19 @@ class SCAResults:
                 os.path.join(outdir, IC_LOADINGS_PER_SEQ_FNAME),
                 **self.ic_loadings_per_seq,
             )
+        if self.component_coverage_per_seq is not None:
+            np.savez_compressed(
+                os.path.join(outdir, COMPONENT_COVERAGE_PER_SEQ_FNAME),
+                **self.component_coverage_per_seq,
+            )
+
+        # Optional sequence metadata table (always TSV — pandas is a
+        # hard dep so loaders can rely on its presence).
+        if self.sequence_metadata is not None:
+            self.sequence_metadata.to_csv(
+                os.path.join(outdir, SEQUENCE_METADATA_FNAME),
+                sep="\t", index=False,
+            )
 
     @classmethod
     def load(cls, dirpath):
@@ -931,6 +1162,21 @@ class SCAResults:
                 np.load(loadings_path, allow_pickle=True)
             )
 
+        component_coverage_per_seq = None
+        coverage_path = os.path.join(
+            dirpath, COMPONENT_COVERAGE_PER_SEQ_FNAME,
+        )
+        if os.path.isfile(coverage_path):
+            component_coverage_per_seq = dict(
+                np.load(coverage_path, allow_pickle=True)
+            )
+
+        sequence_metadata = None
+        md_path = os.path.join(dirpath, SEQUENCE_METADATA_FNAME)
+        if os.path.isfile(md_path):
+            import pandas as pd
+            sequence_metadata = pd.read_csv(md_path, sep="\t")
+
         return cls(
             Dia=Dia,
             conservation=conservation,
@@ -956,8 +1202,10 @@ class SCAResults:
             group_scores=group_scores,
             ic_residues_per_seq=ic_residues_per_seq,
             ic_loadings_per_seq=ic_loadings_per_seq,
+            component_coverage_per_seq=component_coverage_per_seq,
             t_dists_info=t_dists_info,
             sca_matrix_sector_subset=sca_matrix_sector_subset,
+            sequence_metadata=sequence_metadata,
             args=args,
         )
 

@@ -44,15 +44,75 @@ SCA parameters (see SI of [1]):
                             only. Pass "all" to include every retained
                             sequence, or a path to a text file listing
                             sequence IDs (one per line).
+    --coverage_for        : input-MSA sequences to compute per-component
+                            coverage fractions for
+                            (component_coverage_per_seq.npz). For each
+                            selected sequence, stores a length-
+                            n_components float vector: the fraction of
+                            each IC's high-load positions where the
+                            sequence has a non-gap residue. Default:
+                            "all" — every input MSA sequence, including
+                            those filtered during preprocessing. Pass
+                            "reference" for the reference sequence only,
+                            or a path to a text file listing sequence
+                            IDs (one per line).
 
 Optional:
     --seed                : random seed (None or non-positive auto-picks).
     --load_data           : previous sca-core output directory to reload.
     --save_all            : also write the large Cijab_raw / fijab arrays.
-    --use_jax             : use JAX in the core computations.
+    --save_dataframe      : also write seq_projections.tsv (seq_id,
+                            aligned_sequence, Up_0..Up_{n_components-1})
+                            for every retained sequence. Requires pandas.
+    --seq_metadata        : optional TSV path with a 'seq_id' column plus
+                            any user-supplied columns. Persisted as
+                            sequence_metadata.tsv and merged into
+                            seq_projections.tsv via left-join on seq_id
+                            when --save_dataframe is set.
+    --seq_proj_color_by   : optional column name in --seq_metadata to
+                            color the seq_proj_ic*.png plot by. Numeric
+                            columns get a colorbar; categorical columns
+                            get a legend.
+    --accelerator         : global accelerator preference, one of
+                            {none, gpu}. Default 'none'. When 'gpu',
+                            --freq_method auto-defaults to 'gpu' (a
+                            torch tensordot path with graceful CPU
+                            fallback). Per-step --freq_method overrides.
+    --freq_method         : backend for the fijab kernel. Choices:
+                            'numpy' (CPU tensordot, ~9x faster than the
+                            legacy v1 numpy double-loop), 'jax' (whole-
+                            tensordot under jax.jit), 'gpu' (torch
+                            tensordot, falls back to CPU on no-GPU).
+                            When unset, resolved via --accelerator.
+    --use_jax             : DEPRECATED alias for --freq_method=jax.
+                            Emits a DeprecationWarning when used.
+    --precision           : GPU compute precision for the fijab and
+                            eigvalsh-bootstrap kernels. {fp64 (default,
+                            matches CPU bit-for-bit), fp32 (~2x faster,
+                            ~7-decimal precision), fp16 (highest
+                            throughput on tensor cores; eigvalsh
+                            auto-promotes to fp32 — preview-only)}.
+                            Ignored on CPU kernels.
+    --bootstrap_chunk     : number of bootstrap iterations to batch
+                            per GPU dispatch when --freq_method=gpu.
+                            Default 1 (per-iter; today's behavior).
+                            Larger chunks amortize per-iter setup at
+                            the cost of multiplying peak GPU memory.
+                            Auto-reduced on OOM. Ignored on non-GPU
+                            paths.
     --nodendro            : skip the sequence-similarity / dendrogram plots.
-    --sector_cmap         : {"default", "none"} sector palette for the
-                            sector-subset plot.
+    --plot / --no-plot    : write diagnostic plots to outdir/images/.
+                            Default: on. Pass --no-plot to skip plot
+                            generation entirely (no images/ dir created).
+    --sector_colors       : sector palette for the sector-subset plot.
+                            Accepts: "default" (built-in 20-color
+                            palette), "none" (skip per-sector
+                            coloring), a comma-separated list of hex /
+                            named colors (e.g.
+                            "#e377c2,#f62727,red"), a path to a .json
+                            array or one-color-per-line text file, or
+                            the name of a registered matplotlib
+                            colormap (e.g. "tab10", "Set1").
     --pbar                : tqdm progress bars for bootstrap iterations.
     -v --verbosity        : 0=warnings only; higher = more detail.
 
@@ -77,6 +137,13 @@ ic_loadings_per_seq.npz
     Per-residue IC loadings parallel to ic_residues_per_seq, same
     `ic_{i}_{seqid}` key format.
 
+component_coverage_per_seq.npz
+    Per-input-sequence per-IC coverage fractions, keyed by `seq_id`.
+    Each value is a length-n_components float vector. Populated for
+    sequences selected by --coverage_for (default: every input MSA
+    sequence, including those filtered during preprocessing). NaN
+    entries flag ICs whose high-load position set is empty.
+
 sca_results/
     v_ica_normalized.npy, w_ica.npy, t_dists_info.json, evals_shuff.npy,
     sca_matrix_sector_subset.npy, scalar txt files.
@@ -90,9 +157,21 @@ ic_positions/
 scarun.log
     Run log including the human-readable top-N IC summary.
 
+seq_projections.tsv (only when --save_dataframe)
+    Tab-separated table with one row per retained sequence: seq_id,
+    aligned_sequence, Up_0..Up_{n_components-1}. When --seq_metadata
+    is also supplied, that file's non-seq_id columns are merged in
+    via left-join on seq_id.
+
+sequence_metadata.tsv (only when --seq_metadata is supplied)
+    Verbatim copy of the user-supplied metadata TSV.
+
 images/
     Conservation, SCA-matrix, spectrum, dendrogram, t-distribution,
-    EV/IC 2D/3D scatter, and sector-subset figures.
+    EV/IC 2D/3D scatter, sector-subset, and seq_proj_ic0v1.png (sequences
+    projected onto the first two ICs via SCAResults.project_sequences).
+    Only written when --plot is set (the default); --no-plot skips the
+    directory entirely.
 
 -------------------------------------------------------------------------------
 EXAMPLE USAGE:
@@ -134,7 +213,16 @@ from mysca.helpers import get_rawseq_scores_in_groups
 from mysca.helpers import get_group_rawseq_positions_by_entry
 from mysca.helpers import get_group_rawseq_scores_by_entry
 from mysca.helpers import get_rawseq_indices_of_msa
-from mysca.constants import SECTOR_COLORS, DEFAULT_BACKGROUND_FREQ
+from mysca.constants import DEFAULT_BACKGROUND_FREQ, resolve_sector_colors
+from mysca.core import (
+    FREQ_METHOD_CHOICES,
+    _resolve_freq_method,
+    _compute_eigvalsh_bootstrap_gpu,
+)
+from mysca._acceleration import (
+    ACCELERATOR_CHOICES, PRECISION_CHOICES, DEFAULT_PRECISION,
+    resolve_method,
+)
 
 from mysca.pl import (
     plot_conservation,
@@ -149,7 +237,9 @@ from mysca.pl import (
     plot_sca_spectrum,
     plot_sca_spectrum_vs_null,
     plot_sequence_similarity,
+    plot_seq_projection_2d,
     plot_t_distributions,
+    resolve_color_values,
 )
 
 SCARUN_LOG_FNAME = "scarun.log"
@@ -188,17 +278,95 @@ def parse_args(args):
                         help="Random seed for reproducibility. None or a "
                         "non-positive value auto-generates one.")
     
-    parser.add_argument("--use_jax", action="store_true", 
-                        help="Use JAX in computations.")
-    
-    parser.add_argument("--nodendro", action="store_true", 
+    parser.add_argument(
+        "--accelerator", type=str, default="none",
+        choices=list(ACCELERATOR_CHOICES),
+        help="Global accelerator preference. 'none' (default) keeps "
+             "the CPU-default kernels. 'gpu' flips per-step kernel "
+             "defaults to their GPU variants where available "
+             "(currently: --freq_method auto-selects 'gpu'). An "
+             "explicit --freq_method overrides this preference.",
+    )
+    parser.add_argument(
+        "--precision", type=str, default=DEFAULT_PRECISION,
+        choices=list(PRECISION_CHOICES),
+        help="GPU compute precision for the fijab and eigvalsh-bootstrap "
+             "kernels. fp64 (default) matches the CPU path bit-for-bit. "
+             "fp32 (~2x faster on most GPUs, ~7-decimal precision — "
+             "adequate for routine analysis). fp16 (highest throughput "
+             "on tensor cores; ~10⁻³ relative precision — numerically "
+             "risky for downstream eigvalsh on small eigenvalues, treat "
+             "as preview-only). Ignored on CPU kernels.",
+    )
+    parser.add_argument(
+        "--bootstrap_chunk", type=int, default=1,
+        help="Number of bootstrap iterations to batch per GPU "
+             "dispatch when --freq_method=gpu. Default 1 (per-iter "
+             "GPU dispatch — equivalent to today's behavior). Larger "
+             "chunks amortize per-iter setup but multiply the peak "
+             "GPU memory by chunk_size; reduce automatically on OOM. "
+             "Ignored on non-GPU paths (numpy / jax).",
+    )
+    parser.add_argument(
+        "--freq_method", type=str, default=None,
+        choices=list(FREQ_METHOD_CHOICES),
+        help="Backend for the compute_fijab kernel. When unset, "
+             "resolves via --accelerator: 'none' -> 'numpy' (CPU "
+             "tensordot, ~9x faster than the legacy v1 double-loop on "
+             "SH3-scale input); 'gpu' -> 'gpu' (torch tensordot with "
+             "graceful CPU fallback). 'jax' is also available "
+             "(whole-tensordot under jax.jit). See "
+             "docs/cli_reference.md.",
+    )
+    parser.add_argument(
+        "--use_jax", action="store_true",
+        help="DEPRECATED: alias for --freq_method=jax. Emits a "
+             "DeprecationWarning when used. Will be removed in a "
+             "future release.",
+    )
+
+
+    parser.add_argument("--nodendro", action="store_true",
                         help="Skip dendrogram plots")
-    parser.add_argument("--save_all", action="store_true", 
+    parser.add_argument(
+        "--plot", default=True, action=argparse.BooleanOptionalAction,
+        help="Write diagnostic plots to outdir/images/. Default: on. "
+             "Pass --no-plot to skip plot generation entirely (no "
+             "images/ directory is created).",
+    )
+    parser.add_argument("--save_all", action="store_true",
                         help="Save all SCA results (includes large files).")
-    parser.add_argument("--load_data", type=str, default="", 
+    parser.add_argument(
+        "--save_dataframe", action="store_true",
+        help="Also write seq_projections.tsv to outdir, with columns "
+             "seq_id, aligned_sequence, Up_0..Up_{n_components-1} for "
+             "every retained sequence. Requires pandas.",
+    )
+    parser.add_argument(
+        "--seq_metadata", type=str, default=None, metavar="TSV",
+        help="Optional path to a TSV with a 'seq_id' column plus any "
+             "number of additional columns (e.g. taxid, kingdom, "
+             "phylum). Persisted alongside SCAResults as "
+             "sequence_metadata.tsv and merged into seq_projections.tsv "
+             "via left-join on seq_id when --save_dataframe is set.",
+    )
+    parser.add_argument(
+        "--seq_proj_color_by", type=str, default=None, metavar="COLUMN",
+        help="Optional column name in --seq_metadata to color the "
+             "seq_proj_ic*.png plot by. Numeric columns get a colorbar; "
+             "categorical columns get a legend.",
+    )
+    parser.add_argument("--load_data", type=str, default="",
                         help="SCA directory to load precomputed data.")
-    parser.add_argument("--sector_cmap", type=str, default="default",
-                        choices=["none", "default"])
+    parser.add_argument(
+        "--sector_colors", type=str, default="default", metavar="SPEC",
+        help="Sector palette for the sector-subset plot. SPEC accepts: "
+        "'default' (built-in 20-color palette), 'none' (skip "
+        "per-sector coloring), a comma-separated list of hex / named "
+        "colors, a path to a .json or text file, or the name of a "
+        "registered matplotlib colormap (e.g. 'tab10', 'Set1'). "
+        "Default: 'default'.",
+    )
     
     sca_params = parser.add_argument_group("SCA parameters")
     sca_params.add_argument("--regularization", type=float, default=0.03,
@@ -234,8 +402,15 @@ def parse_args(args):
         "where its IC-projection is maximal (this was the previous "
         "default). --weak_assignment only applies under 'exclusive'.",
     )
-    sca_params.add_argument("--weak_assignment", type=int, nargs="*",
-                        default=[])
+    sca_params.add_argument(
+        "--weak_assignment", type=int, nargs="*", default=[],
+        help="IC indices to exclude from the `exclusive`-assignment "
+        "tie-break (variadic integers). Positions that clear the "
+        "t-distribution cutoff for a listed IC will not be claimed by "
+        "that IC under `--assignment exclusive` and remain available "
+        "for assignment to other ICs. Ignored under `--assignment "
+        "overlap`.",
+    )
 
     parser.add_argument("--sectors_for", type=str, default=None,
                         help="Which target sequences to expand into the "
@@ -244,6 +419,22 @@ def parse_args(args):
                              "the reference sequence. 'all' for every "
                              "retained sequence, or a path to a text file "
                              "with one sequence ID per line.")
+
+    parser.add_argument("--coverage_for", type=str, default="all",
+                        help="Which input-MSA sequences to compute "
+                             "per-component coverage fractions for "
+                             "(component_coverage_per_seq.npz). For each "
+                             "selected sequence, stores a length-"
+                             "n_components float vector: the fraction of "
+                             "each IC's high-load positions where the "
+                             "sequence has a non-gap residue. Default: "
+                             "'all' input MSA sequences, including those "
+                             "filtered during preprocessing (so coverage "
+                             "explains why a sequence was dropped). Pass "
+                             "a path to a text file with one sequence ID "
+                             "per line to restrict, or the literal string "
+                             "'reference' to compute only for the "
+                             "reference sequence.")
 
     return parser.parse_args(args)
 
@@ -258,13 +449,42 @@ def main(args):
     PBAR = args.pbar
     SEED = args.seed
     DENDRO = not args.nodendro
+    DO_PLOT = args.plot
     LOAD_DATA = args.load_data
     USE_JAX = args.use_jax
+    ACCELERATOR = args.accelerator
+    PRECISION = args.precision
+    if PRECISION == "fp16":
+        logger.warning(
+            "--precision=fp16 enabled. Eigvalsh on fp16 is unstable; "
+            "the bootstrap kernel auto-promotes to fp32 for the "
+            "eigendecomposition. fijab is computed in fp16 and may lose "
+            "precision in low-magnitude correlations. Treat as a "
+            "preview; rerun with fp32 or fp64 for publication.",
+        )
+    BOOTSTRAP_CHUNK = max(1, int(args.bootstrap_chunk))
+    # Resolve --freq_method / --accelerator / --use_jax once up front.
+    # Precedence: explicit --freq_method wins; else --use_jax (deprecated)
+    # routes to 'jax' with a DeprecationWarning; else --accelerator gpu
+    # routes to 'gpu'; else 'numpy' (CPU default).
+    FREQ_METHOD = resolve_method(
+        method=args.freq_method,
+        accelerator=ACCELERATOR,
+        cpu_default="numpy",
+        gpu_choice="gpu",
+        deprecated_alias=USE_JAX,
+        deprecated_alias_name="--use_jax",
+        deprecated_alias_target="jax",
+    )
     SAVE_ALL = args.save_all
-    sector_cmap = args.sector_cmap
+    SAVE_DATAFRAME = args.save_dataframe
+    SEQ_METADATA_PATH = args.seq_metadata
+    SEQ_PROJ_COLOR_BY = args.seq_proj_color_by
+    sector_color_set = resolve_sector_colors(args.sector_colors)
     assignment_method = args.assignment
     weak_assignment = args.weak_assignment
     sectors_for = args.sectors_for
+    coverage_for = args.coverage_for
 
     regularization = args.regularization
     background_freq = args.background
@@ -285,7 +505,8 @@ def main(args):
     IMGDIR = os.path.join(OUTDIR, "images")
     os.makedirs(OUTDIR, exist_ok=True)
     os.makedirs(SCADIR, exist_ok=True)
-    os.makedirs(IMGDIR, exist_ok=True)
+    if DO_PLOT:
+        os.makedirs(IMGDIR, exist_ok=True)
 
     configure_logging(
         verbosity=verbosity,
@@ -312,12 +533,6 @@ def main(args):
         msg = f"Cannot handle given argument for background: {background_freq}"
         raise RuntimeError(msg)
 
-    # Predefined colors for the sectors
-    sector_color_set = {
-        "default": SECTOR_COLORS,
-        "none": None,
-    }[sector_cmap]
-
     # Load preprocessed data
     if not os.path.isdir(indir):
         msg = f"Preprocessed data directory not found! {indir}"
@@ -330,8 +545,8 @@ def main(args):
     weights = prep.sequence_weights
     msa_binary3d = prep.msa_binary3d
     NSYMS = len(sym_map)
-    msa_obj_orig = prep.msa_obj_orig
-    NUM_POS_ORIG = msa_obj_orig.get_alignment_length()
+    msa_obj_loaded = prep.msa_obj_loaded
+    NUM_POS_ORIG = msa_obj_loaded.get_alignment_length()
 
     # Create the background frequency distribution q
     logger.info("Background frequencies:")
@@ -359,7 +574,8 @@ def main(args):
             return_keys="all",
             pbar=PBAR,
             leave_pbar=True,
-            use_jax=USE_JAX,
+            freq_method=FREQ_METHOD,
+            precision=PRECISION,
         )
         results = SCAResults.from_core_output(sca_results)
         Dia = results.Dia
@@ -394,7 +610,72 @@ def main(args):
     DO_SHUFFLING = N_BOOT > 0
     evals_shuff = np.full([N_BOOT, *evals_sca.shape], np.nan)
     evals_shuff_fpath = os.path.join(SCADIR, EVALS_SHUFF_SAVEAS)
-    if DO_SHUFFLING:
+    use_gpu_batch = (
+        DO_SHUFFLING
+        and FREQ_METHOD == "gpu"
+        and BOOTSTRAP_CHUNK > 1
+    )
+    if use_gpu_batch:
+        ws_norm = (weights / weights.sum()).astype(np.float64)
+        ws_for_bootstrap = ws_norm
+        # qa_for_bootstrap mirrors run_sca: derived from background_freq
+        # via mapping.aa_list, then renormalized to sum to 1.
+        qa_for_bootstrap = np.array(
+            [background_freq.get(a, 0.0) for a in sym_map.aa_list]
+        )
+        if background_freq_array is not None:
+            qa_for_bootstrap = background_freq_array
+        qa_for_bootstrap = qa_for_bootstrap / qa_for_bootstrap.sum()
+        nsyms_for_bootstrap = NSYMS
+        chunk_size = BOOTSTRAP_CHUNK
+        logger.info(
+            "Batched-GPU bootstrap: %d iters in chunks of %d.",
+            N_BOOT, chunk_size,
+        )
+        i = 0
+        progress = tqdm.tqdm(total=N_BOOT, disable=not PBAR)
+        while i < N_BOOT:
+            j = min(i + chunk_size, N_BOOT)
+            bsize = j - i
+            shuffled = np.empty((bsize, *msa.shape), dtype=msa.dtype)
+            for b in range(bsize):
+                shuffled[b] = shuffle_columns(msa, rng=rng)
+            xmsa_batch = onehot_without_gap(
+                shuffled, NSYMS, sym_map.gapint,
+            )  # (bsize, nseq, npos, naas)
+            try:
+                evals_chunk = _compute_eigvalsh_bootstrap_gpu(
+                    xmsa_batch, ws_for_bootstrap,
+                    qa=qa_for_bootstrap,
+                    lam=regularization,
+                    nsyms=nsyms_for_bootstrap,
+                    precision=PRECISION,
+                )
+            except RuntimeError as exc:
+                # OOM or no-GPU. Halve and retry, or fall back to per-iter.
+                if "memory" in str(exc).lower() and chunk_size > 1:
+                    new_chunk = max(1, chunk_size // 2)
+                    logger.warning(
+                        "Batched bootstrap OOM at chunk_size=%d "
+                        "(%s: %s); retrying with chunk_size=%d.",
+                        chunk_size, type(exc).__name__, exc, new_chunk,
+                    )
+                    chunk_size = new_chunk
+                    continue
+                logger.warning(
+                    "Batched bootstrap unavailable: %s: %s. "
+                    "Falling back to per-iter CPU loop.",
+                    type(exc).__name__, exc,
+                )
+                use_gpu_batch = False
+                break
+            evals_shuff[i:j] = evals_chunk
+            progress.update(bsize)
+            i = j
+        progress.close()
+        if use_gpu_batch:
+            np.save(evals_shuff_fpath, evals_shuff)
+    if DO_SHUFFLING and not use_gpu_batch:
         for iteridx in tqdm.trange(N_BOOT):
             msa_shuff = shuffle_columns(msa, rng=rng)
             xmsa_shuff = onehot_without_gap(msa_shuff, NSYMS, sym_map.gapint)
@@ -407,6 +688,8 @@ def main(args):
                 return_keys=["Cij_corr"],
                 pbar=PBAR,
                 leave_pbar=False,
+                freq_method=FREQ_METHOD,
+                precision=PRECISION,
             )
             cij_shuff = res["Cij_corr"]
             evals = np.linalg.eigvalsh(cij_shuff)
@@ -563,14 +846,14 @@ def main(args):
     ref_id_for_log = prep.args.get("reference_id") if prep.args else None
     log_top_ic_summary(
         groups, kstar, evals_sca, retained_positions,
-        msa_obj_orig, ref_id_for_log,
+        msa_obj_loaded, ref_id_for_log,
         n_logged_comps=n_logged_comps,
     )
 
     # Determine which sequences to generate per-sequence sector mappings for.
     # IDs that were filtered out during preprocessing are silently skipped.
     retained_ids = set(
-        msa_obj_orig[int(sidx)].id for sidx in retained_sequences
+        msa_obj_loaded[int(sidx)].id for sidx in retained_sequences
     )
     if sectors_for is not None and sectors_for.lower() == "all":
         sector_seqidxs = retained_sequences
@@ -589,7 +872,7 @@ def main(args):
         found_ids = requested_ids & retained_ids
         sector_seqidxs = np.array([
             sidx for sidx in retained_sequences
-            if msa_obj_orig[int(sidx)].id in found_ids
+            if msa_obj_loaded[int(sidx)].id in found_ids
         ])
         logger.info(
             "Generating per-sequence sectors for %d/%d sequences.",
@@ -601,7 +884,7 @@ def main(args):
         if ref_id is not None and ref_id in retained_ids:
             sector_seqidxs = np.array([
                 sidx for sidx in retained_sequences
-                if msa_obj_orig[int(sidx)].id == ref_id
+                if msa_obj_loaded[int(sidx)].id == ref_id
             ])
             logger.info(
                 "Generating per-sequence sectors for reference sequence: %s",
@@ -621,15 +904,100 @@ def main(args):
                     "Skipping per-sequence sector mappings."
                 )
 
-    # Map processed MSA positions to original sequence positions
-    rawseq_idxs = get_rawseq_indices_of_msa(msa_obj_orig)
-    rawseq_idxs = rawseq_idxs[retained_sequences,:]
-    rawseq_idxs = rawseq_idxs[:,retained_positions]
+    # Determine which input-MSA sequences to compute per-component
+    # coverage fractions for. Resolves against ALL input MSA sequences
+    # (i.e. msa_obj_loaded), not just retained_sequences — sequences
+    # dropped during preprocessing still have meaningful coverage stats
+    # that explain *why* they were dropped.
+    input_ids = [rec.id for rec in msa_obj_loaded]
+    input_ids_set = set(input_ids)
+    M_input = len(msa_obj_loaded)
+    if coverage_for is not None and coverage_for.lower() == "all":
+        coverage_seqidxs = np.arange(M_input)
+    elif coverage_for is not None and coverage_for.lower() == "reference":
+        ref_id = prep.args.get("reference_id") if prep.args else None
+        if ref_id is not None and ref_id in input_ids_set:
+            coverage_seqidxs = np.array(
+                [m for m, sid in enumerate(input_ids) if sid == ref_id],
+                dtype=int,
+            )
+        else:
+            coverage_seqidxs = np.array([], dtype=int)
+            if ref_id is None:
+                logger.info(
+                    "No reference sequence specified. "
+                    "Skipping per-sequence component coverage."
+                )
+            else:
+                logger.info(
+                    "Reference sequence '%s' not found in input MSA. "
+                    "Skipping per-sequence component coverage.",
+                    ref_id,
+                )
+    elif coverage_for is not None:
+        with open(coverage_for, "r") as f:
+            requested_ids = set(
+                line.strip() for line in f if line.strip()
+            )
+        missing_ids = requested_ids - input_ids_set
+        if missing_ids:
+            logger.info(
+                "Note: %d requested coverage sequence(s) not found in "
+                "the input MSA: %s",
+                len(missing_ids), ", ".join(sorted(missing_ids)),
+            )
+        found_ids = requested_ids & input_ids_set
+        coverage_seqidxs = np.array(
+            [m for m, sid in enumerate(input_ids) if sid in found_ids],
+            dtype=int,
+        )
+        logger.info(
+            "Computing per-component coverage for %d/%d input MSA "
+            "sequences.",
+            len(coverage_seqidxs), M_input,
+        )
+    else:
+        coverage_seqidxs = np.array([], dtype=int)
 
-    # Compute residue groups by raw sequence position (for subset only)
-    sector_rawseq_idxs = rawseq_idxs[
-        np.isin(retained_sequences, sector_seqidxs)
-    ]
+    if len(coverage_seqidxs) > 0 and len(groups) > 0:
+        gapsym = (
+            sym_map.gapsym if hasattr(sym_map, "gapsym") else "-"
+        )
+        gap_byte = gapsym.encode("ascii")
+        L_orig = msa_obj_loaded.get_alignment_length()
+        seq_bytes = np.empty(
+            (len(coverage_seqidxs), L_orig), dtype="S1",
+        )
+        for j, m in enumerate(coverage_seqidxs):
+            seq_bytes[j] = np.frombuffer(
+                str(msa_obj_loaded[int(m)].seq).encode("ascii"),
+                dtype="S1",
+            )
+        nongap_mask = seq_bytes != gap_byte
+        n_components_total = len(groups)
+        coverage_matrix = np.empty(
+            (len(coverage_seqidxs), n_components_total), dtype=np.float64,
+        )
+        for i in range(n_components_total):
+            grp = np.asarray(groups[i], dtype=int)
+            if grp.size == 0:
+                coverage_matrix[:, i] = np.nan
+            else:
+                orig_cols = retained_positions[grp]
+                non_gap_count = nongap_mask[:, orig_cols].sum(axis=1)
+                coverage_matrix[:, i] = non_gap_count / grp.size
+        component_coverage_per_seq = {}
+        for j, m in enumerate(coverage_seqidxs):
+            sid = msa_obj_loaded[int(m)].id
+            component_coverage_per_seq[sid] = coverage_matrix[j].copy()
+        results.component_coverage_per_seq = component_coverage_per_seq
+    else:
+        results.component_coverage_per_seq = {}
+
+    # Map processed MSA positions to original sequence positions
+    sector_rawseq_idxs = get_rawseq_indices_of_msa(
+        msa_obj_loaded, seqidxs=sector_seqidxs,
+    )[:, retained_positions]
     group_rawseq_positions = get_rawseq_positions_in_groups(
         sector_rawseq_idxs, groups
     )
@@ -637,23 +1005,18 @@ def main(args):
         sector_rawseq_idxs, groups, group_scores
     )
     group_rawseq_positions_by_entry = get_group_rawseq_positions_by_entry(
-        msa_obj_orig, sector_seqidxs, groups, group_rawseq_positions
+        msa_obj_loaded, sector_seqidxs, groups, group_rawseq_positions
     )
     group_rawseq_scores_by_entry = get_group_rawseq_scores_by_entry(
-        msa_obj_orig, sector_seqidxs, groups, group_rawseq_scores
+        msa_obj_loaded, sector_seqidxs, groups, group_rawseq_scores
     )
-    # Per-target IC residues (and parallel IC loadings) scale with
-    # n_components × |sector_seqidxs| and dominate on-disk size when the
-    # user requests many ICs plus `--sectors_for all`. Restrict to the
-    # kstar significant ICs; non-significant ICs still have their
-    # position arrays on disk (via SCAResults.save) but aren't expanded
-    # per sequence.
+    
     ic_residues_per_seq = {}
     ic_loadings_per_seq = {}
     n_sector_groups = min(kstar, len(groups))
     for gidx in range(n_sector_groups):
         for seqidx in sector_seqidxs:
-            entry = msa_obj_orig[int(seqidx)]
+            entry = msa_obj_loaded[int(seqidx)]
             sid = entry.id
             residues = group_rawseq_positions_by_entry[sid][gidx]
             loadings = group_rawseq_scores_by_entry[sid][gidx]
@@ -681,32 +1044,87 @@ def main(args):
         "pstar": int(pstar),
         "assignment": assignment_method,
         "n_logged_comps": int(n_logged_comps),
+        "plot": bool(DO_PLOT),
+        "freq_method": FREQ_METHOD,
+        "accelerator": ACCELERATOR,
+        "precision": PRECISION,
+        "bootstrap_chunk": int(BOOTSTRAP_CHUNK),
+        "sectors_for": sectors_for,
+        "coverage_for": coverage_for,
     }
+    if SEQ_METADATA_PATH is not None:
+        import pandas as pd
+        md = pd.read_csv(SEQ_METADATA_PATH, sep="\t")
+        if "seq_id" not in md.columns:
+            raise ValueError(
+                f"--seq_metadata TSV {SEQ_METADATA_PATH!r} is missing "
+                f"required 'seq_id' column. Got columns: "
+                f"{list(md.columns)!r}"
+            )
+        results.sequence_metadata = md
+        logger.info(
+            "Loaded sequence metadata: %d rows, %d cols (%s)",
+            len(md), len(md.columns), ", ".join(md.columns),
+        )
+
     results.save(
         OUTDIR, save_all=SAVE_ALL, retained_positions=retained_positions,
     )
 
-    make_plots(
-        retained_positions, 
-        Di, 
-        NUM_POS_ORIG,
-        IMGDIR, 
-        DENDRO,
-        msa_binary3d,
-        Cij_raw,
-        Cij,
-        evals_shuff,
-        evals_sca,
-        cutoff,
-        N_BOOT,
-        kstar,
-        v_ica_normalized,
-        t_dists_info,
-        groups,
-        sig_evecs_sca,
-        sca_mat_imp,
-        sector_color_set,
-    )
+    if SAVE_DATAFRAME:
+        df = results.to_dataframe(prep)
+        df_path = os.path.join(OUTDIR, "seq_projections.tsv")
+        df.to_csv(df_path, sep="\t", index=False)
+        logger.info("Wrote sequence projection DataFrame to %s", df_path)
+
+    if DO_PLOT:
+        up_seq = results.project_sequences(msa_binary3d)
+        color_values = None
+        color_label = None
+        if SEQ_PROJ_COLOR_BY is not None:
+            if results.sequence_metadata is None:
+                logger.warning(
+                    "--seq_proj_color_by=%r ignored: no --seq_metadata "
+                    "supplied.", SEQ_PROJ_COLOR_BY,
+                )
+            elif SEQ_PROJ_COLOR_BY not in results.sequence_metadata.columns:
+                logger.warning(
+                    "--seq_proj_color_by=%r ignored: column not found in "
+                    "sequence_metadata. Available: %s",
+                    SEQ_PROJ_COLOR_BY,
+                    list(results.sequence_metadata.columns),
+                )
+            else:
+                color_values = resolve_color_values(
+                    results.sequence_metadata,
+                    list(prep.retained_sequence_ids),
+                    SEQ_PROJ_COLOR_BY,
+                )
+                color_label = SEQ_PROJ_COLOR_BY
+        make_plots(
+            retained_positions,
+            Di,
+            NUM_POS_ORIG,
+            IMGDIR,
+            DENDRO,
+            msa_binary3d,
+            Cij_raw,
+            Cij,
+            evals_shuff,
+            evals_sca,
+            cutoff,
+            N_BOOT,
+            kstar,
+            v_ica_normalized,
+            t_dists_info,
+            groups,
+            sig_evecs_sca,
+            sca_mat_imp,
+            sector_color_set,
+            up_seq=up_seq,
+            seq_proj_color_values=color_values,
+            seq_proj_color_label=color_label,
+        )
 
     logger.info("Done!")
 
@@ -725,6 +1143,7 @@ def apply_ica(
         max_attempts,
 ):
     n_attempts = 0
+    last_delta = None
     while n_attempts < max_attempts:
         n_attempts += 1
         w_ica, ica_delta = run_ica(
@@ -733,25 +1152,37 @@ def apply_ica(
             tol=tol,
             maxiter=maxiter,
         )
+        last_delta = ica_delta
         if w_ica is None:
+            new_maxiter = maxiter * 2
+            new_rho = rho / 2
             logger.warning(
-                "ICA did not converge with parameters rho=%.3g, tol=%.3g, "
-                "maxiter=%s. (Reached tol=%.3g)",
-                rho, tol, maxiter, ica_delta,
+                "ICA attempt %d/%d did not converge: achieved Δ=%.3g "
+                "vs. tol=%.3g (ratio %.2gx) with rho=%.3g, maxiter=%s. "
+                "Retrying with rho=%.3g, maxiter=%s.",
+                n_attempts, max_attempts, ica_delta, tol,
+                ica_delta / tol if tol > 0 else float("nan"),
+                rho, maxiter, new_rho, new_maxiter,
             )
-            maxiter *= 2
-            rho /= 2
+            maxiter = new_maxiter
+            rho = new_rho
         else:
             v_ica = sig_evecs_sca @ w_ica.T
             logger.info(
-                "ICA succeeded after %d attempts. (tol=%.2g)",
-                n_attempts, tol,
+                "ICA succeeded after %d attempts. (Δ=%.2g vs. tol=%.2g)",
+                n_attempts, ica_delta, tol,
             )
             break
 
     # Check success
     if w_ica is None:
-        raise RuntimeError(f"ICA failed to converge in {max_attempts} attempts.")
+        raise RuntimeError(
+            f"ICA failed to converge in {max_attempts} attempts. "
+            f"Final achieved Δ={last_delta:.3g} vs. tol={tol:.3g} "
+            f"(ratio {last_delta/tol if tol > 0 else float('nan'):.2g}x). "
+            f"Consider lowering --ica_rho, raising --ica_tol, or "
+            f"increasing --ica_max_attempts."
+        )
 
     # Normalize V and ensure positivity of maximum entry.
     v_ica_normalized = v_ica / np.sqrt(np.sum(np.square(v_ica), axis=0))
@@ -774,7 +1205,7 @@ def _format_list(values):
 
 def log_top_ic_summary(
         groups, kstar, evals_sca, retained_positions,
-        msa_obj_orig, reference_id, *, n_logged_comps=10,
+        msa_obj_loaded, reference_id, *, n_logged_comps=10,
 ):
     """Write a human-readable summary of the top-N ICs to the module logger.
 
@@ -792,7 +1223,7 @@ def log_top_ic_summary(
       acids involved without cross-referencing the MSA.
 
     The reference block is only emitted when ``reference_id`` resolves
-    to a row in ``msa_obj_orig``; the header echoes the chosen
+    to a row in ``msa_obj_loaded``; the header echoes the chosen
     reference so downstream readers aren't guessing.
 
     No-op when ``n_logged_comps <= 0`` or ``groups`` is empty.
@@ -803,12 +1234,13 @@ def log_top_ic_summary(
     aligned_ref = None
     ref_raw_positions = None
     if reference_id is not None:
-        ids = [rec.id for rec in msa_obj_orig]
+        ids = [rec.id for rec in msa_obj_loaded]
         if reference_id in ids:
             ref_row = ids.index(reference_id)
-            aligned_ref = str(msa_obj_orig[ref_row].seq)
-            all_raw = get_rawseq_indices_of_msa(msa_obj_orig)
-            ref_raw_positions = all_raw[ref_row]  # shape (npos_orig,)
+            aligned_ref = str(msa_obj_loaded[ref_row].seq)
+            ref_raw_positions = get_rawseq_indices_of_msa(
+                msa_obj_loaded, seqidxs=np.array([ref_row]),
+            )[0]  # shape (npos_orig,)
 
     n_show = min(n_logged_comps, len(groups))
     header_tag = (
@@ -992,6 +1424,8 @@ IC_AXES_2D = EV_AXES_2D
 IC_AXES_3D = EV_AXES_3D
 
 
+
+
 def make_plots(
         retained_positions,
         Di,
@@ -1012,6 +1446,10 @@ def make_plots(
         sig_evecs_sca,
         sca_mat_imp,
         sector_color_set,
+        *,
+        up_seq=None,
+        seq_proj_color_values=None,
+        seq_proj_color_label=None,
 ):
     plot_conservation_top(retained_positions, Di, NUM_POS_ORIG, IMGDIR)
     plot_conservation_positional(retained_positions, Di, NUM_POS_ORIG, IMGDIR)
@@ -1056,6 +1494,13 @@ def make_plots(
     plot_sca_matrix_sector_subset(
         sca_mat_imp, groups, sector_color_set, IMGDIR,
     )
+
+    if up_seq is not None:
+        plot_seq_projection_2d(
+            up_seq, (0, 1), IMGDIR,
+            color_values=seq_proj_color_values,
+            color_label=seq_proj_color_label,
+        )
 
 
 if __name__ == "__main__":

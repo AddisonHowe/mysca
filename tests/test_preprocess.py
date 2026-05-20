@@ -250,15 +250,15 @@ def test_preprocessing(
         gap_value=gap_value,
     )
 
-    msa_obj, msa_orig, msa_ids_orig, _ = load_msa(
+    msa_obj, msa_loaded, msa_ids_loaded, _, _, _, _ = load_msa(
         fa_fpath, format="fasta", mapping=symmap,
     )
     msa_obj_length = len(msa_obj)
-    msa_orig_shape = msa_orig.shape
-    msa_ids_orig_length = len(msa_ids_orig)
+    msa_loaded_shape_pre = msa_loaded.shape
+    msa_ids_loaded_length_pre = len(msa_ids_loaded)
 
     msa, preprocessing_results = preprocess_msa(
-        msa_orig, msa_ids_orig, 
+        msa_loaded, msa_ids_loaded, 
         mapping=symmap, 
         gap_truncation_thresh=gap_truncation_thresh,
         sequence_gap_thresh=sequence_gap_thresh,
@@ -307,12 +307,497 @@ def test_preprocessing(
         msg = "msa_obj changed shape unexpectedly. "
         msg += f"Expected {msa_obj_length}. Got {len(msa_obj)}"
         errors.append(msg)
-    if msa_orig.shape != msa_orig_shape:
-        msg = "msa_orig changed shape unexpectedly. "
-        msg += f"Expected {msa_orig_shape}. Got {msa_orig.shape}"
+    if msa_loaded.shape != msa_loaded_shape_pre:
+        msg = "msa_loaded changed shape unexpectedly. "
+        msg += f"Expected {msa_loaded_shape_pre}. Got {msa_loaded.shape}"
         errors.append(msg)
-    if len(msa_ids_orig) != msa_ids_orig_length:
-        msg = "msa_ids_orig changed shape unexpectedly. "
-        msg += f"Expected {msa_ids_orig_length}. Got {len(msa_ids_orig)}"
+    if len(msa_ids_loaded) != msa_ids_loaded_length_pre:
+        msg = "msa_ids_loaded changed shape unexpectedly. "
+        msg += f"Expected {msa_ids_loaded_length_pre}. Got {len(msa_ids_loaded)}"
         errors.append(msg)
     assert not errors, "Errors occurred:\n{}".format("\n".join(errors))
+
+
+def test_filter_history_records_excluded_symbols_stage():
+    """When n_excluded_pre_load > 0, preprocess_msa prepends an
+    'excluded_symbols' stage immediately after 'initial' and the
+    'initial' bar reflects the pre-exclusion count."""
+    from mysca.preprocess import preprocess_msa
+    from mysca.mappings import SymMap
+
+    sym_map = SymMap("ACDEFGHIKLMNPQRSTVWY", "-")
+    rng = np.random.default_rng(0)
+    msa = rng.integers(0, 20, size=(8, 10), dtype=np.int_)
+    seqids = [f"seq_{i}" for i in range(8)]
+
+    _, results = preprocess_msa(
+        msa, seqids, mapping=sym_map,
+        gap_truncation_thresh=0.5,
+        sequence_gap_thresh=0.5,
+        sequence_similarity_thresh=0.99,
+        position_gap_thresh=0.5,
+        weight_computation_version="sparse",
+        n_excluded_pre_load=3,
+    )
+
+    fh = results["filter_history"]
+    assert fh[0]["stage"] == "initial"
+    assert fh[0]["n_sequences"] == 8 + 3, (
+        "initial bar must show pre-exclusion count when "
+        "n_excluded_pre_load > 0"
+    )
+    assert fh[1]["stage"] == "excluded_symbols"
+    assert fh[1]["n_sequences"] == 8
+    assert fh[1]["n_filtered"] == 3
+    assert fh[1]["axis"] == "sequences"
+    assert fh[1]["stat_values"] is None  # no distribution by design
+
+
+def test_strip_trailing_stops_unit():
+    """The trailing-stop-codon helper handles all the corner cases:
+    pure trailing, gaps between * and the C-terminus, multiple trailing
+    stops, internal *, and clean sequences."""
+    from mysca.io import _strip_trailing_stops
+    cases = [
+        # (in, expected_clean, n_replaced, has_internal)
+        ("ACDE*", "ACDE-", 1, False),
+        ("ACDE-*--", "ACDE----", 1, False),
+        ("AC*DE", "AC*DE", 0, True),
+        ("AC*DE-*--", "AC*DE----", 1, True),
+        ("ACDE", "ACDE", 0, False),
+        ("ACDE**", "ACDE--", 2, False),
+        ("ACDE**--", "ACDE----", 2, False),
+        ("", "", 0, False),
+    ]
+    for inp, exp_clean, exp_n, exp_internal in cases:
+        cleaned, n, internal = _strip_trailing_stops(inp)
+        assert cleaned == exp_clean, f"input={inp!r}: clean={cleaned!r}"
+        assert n == exp_n, f"input={inp!r}: n={n}"
+        assert internal == exp_internal, f"input={inp!r}: internal={internal}"
+
+
+def test_load_msa_strips_trailing_stop_and_drops_internal_stop(tmp_path):
+    """End-to-end: a FASTA mixing trailing-* and internal-* records
+    yields the right counts and post-load contents from load_msa."""
+    from mysca.io import load_msa
+    from mysca.mappings import SymMap
+
+    fa = tmp_path / "stops.faa"
+    # AlignIO requires equal-length records; pad with gaps. Six-column
+    # alignment exercising: clean, trailing-* at end, trailing-* with
+    # gap after, and internal-*.
+    fa.write_text(
+        ">clean\nACDE--\n"
+        ">trailing_at_end\nACDE-*\n"
+        ">trailing_with_gap_after\nACDE*-\n"
+        ">internal\nAC*DE-\n"
+    )
+    sym_map = SymMap("ACDE", "-")
+    msa_obj, _, msa_ids, _, _, n_excluded, n_internal_stop = load_msa(
+        str(fa), format="fasta", mapping=sym_map,
+    )
+    # 1 internal-stop sequence dropped; 0 excluded-symbol drops because
+    # trailing * was replaced by - before the alphabet check.
+    assert n_internal_stop == 1
+    assert n_excluded == 0
+    assert "internal" not in msa_ids
+    assert msa_ids == ["clean", "trailing_at_end", "trailing_with_gap_after"]
+    # Trailing * was replaced by - in the surviving sequences.
+    seqs = {rec.id: str(rec.seq) for rec in msa_obj}
+    assert seqs["trailing_at_end"] == "ACDE--"
+    assert seqs["trailing_with_gap_after"] == "ACDE--"
+
+
+def test_symmap_rejects_star():
+    """Stop codons must not be members of the alphabet."""
+    from mysca.mappings import SymMap
+    with pytest.raises(ValueError, match="stop codon"):
+        SymMap("ACDE*", "-")
+
+
+def test_filter_history_records_internal_stop_codon_stage():
+    """When n_internal_stop_pre_load > 0, preprocess_msa inserts an
+    'internal_stop_codon' stage between 'initial' and any
+    'excluded_symbols' stage."""
+    from mysca.preprocess import preprocess_msa
+    from mysca.mappings import SymMap
+
+    sym_map = SymMap("ACDEFGHIKLMNPQRSTVWY", "-")
+    rng = np.random.default_rng(2)
+    msa = rng.integers(0, 20, size=(5, 8), dtype=np.int_)
+    seqids = [f"seq_{i}" for i in range(5)]
+
+    _, results = preprocess_msa(
+        msa, seqids, mapping=sym_map,
+        gap_truncation_thresh=0.5,
+        sequence_gap_thresh=0.5,
+        sequence_similarity_thresh=0.99,
+        position_gap_thresh=0.5,
+        weight_computation_version="sparse",
+        n_excluded_pre_load=2,
+        n_internal_stop_pre_load=4,
+    )
+    fh = results["filter_history"]
+    stages = [s["stage"] for s in fh]
+    # initial first, then internal_stop_codon, then excluded_symbols.
+    assert stages[:3] == [
+        "initial", "internal_stop_codon", "excluded_symbols",
+    ]
+    assert fh[0]["n_sequences"] == 5 + 2 + 4
+    assert fh[1]["n_sequences"] == 5 + 2
+    assert fh[1]["n_filtered"] == 4
+    assert fh[2]["n_sequences"] == 5
+    assert fh[2]["n_filtered"] == 2
+
+
+def test_filter_history_omits_excluded_symbols_stage_when_none_dropped():
+    """No excluded-symbols stage is recorded when n_excluded_pre_load=0
+    (default), preserving the legacy filter_history shape."""
+    from mysca.preprocess import preprocess_msa
+    from mysca.mappings import SymMap
+
+    sym_map = SymMap("ACDEFGHIKLMNPQRSTVWY", "-")
+    rng = np.random.default_rng(1)
+    msa = rng.integers(0, 20, size=(6, 10), dtype=np.int_)
+    seqids = [f"seq_{i}" for i in range(6)]
+
+    _, results = preprocess_msa(
+        msa, seqids, mapping=sym_map,
+        gap_truncation_thresh=0.5,
+        sequence_gap_thresh=0.5,
+        sequence_similarity_thresh=0.99,
+        position_gap_thresh=0.5,
+        weight_computation_version="sparse",
+    )
+    stages = [s["stage"] for s in results["filter_history"]]
+    assert "excluded_symbols" not in stages
+    assert results["filter_history"][0]["n_sequences"] == 6
+
+
+# --------------------------------------------------------------------------- #
+# Defensive guards: missing reference ID, fully-emptied MSA after filtering.  #
+# --------------------------------------------------------------------------- #
+
+
+def test_missing_reference_id_raises_clear_error():
+    """B1: an unknown --reference must raise ValueError with the offending ID,
+    not an opaque IndexError."""
+    msa_obj, msa_loaded, msa_ids_loaded, _, _, _, _ = load_msa(
+        TEST_MSA4, format="fasta", mapping=SYMMAP2,
+    )
+    with pytest.raises(ValueError, match="not_a_real_id"):
+        preprocess_msa(
+            msa_loaded, msa_ids_loaded,
+            mapping=SYMMAP2,
+            gap_truncation_thresh=1.0,
+            sequence_gap_thresh=1.0,
+            reference_id="not_a_real_id",
+            reference_similarity_thresh=0.0,
+            sequence_similarity_thresh=1.0,
+            position_gap_thresh=1.0,
+        )
+
+
+def test_empty_msa_after_position_gap_filter_raises():
+    """B5: gap_truncation_thresh=0 drops every position; preprocessing must
+    raise rather than silently producing an empty MSA."""
+    msa_obj, msa_loaded, msa_ids_loaded, _, _, _, _ = load_msa(
+        TEST_MSA4, format="fasta", mapping=SYMMAP2,
+    )
+    with pytest.raises(ValueError, match="position gap"):
+        preprocess_msa(
+            msa_loaded, msa_ids_loaded,
+            mapping=SYMMAP2,
+            gap_truncation_thresh=0.0,
+            sequence_gap_thresh=1.0,
+            reference_id=None,
+            reference_similarity_thresh=0.0,
+            sequence_similarity_thresh=1.0,
+            position_gap_thresh=1.0,
+        )
+
+
+def test_empty_msa_after_sequence_gap_filter_raises():
+    """B5: sequence_gap_thresh=0 drops every sequence; preprocessing must
+    raise rather than silently producing an empty MSA."""
+    msa_obj, msa_loaded, msa_ids_loaded, _, _, _, _ = load_msa(
+        TEST_MSA4, format="fasta", mapping=SYMMAP2,
+    )
+    with pytest.raises(ValueError, match="sequence gap"):
+        preprocess_msa(
+            msa_loaded, msa_ids_loaded,
+            mapping=SYMMAP2,
+            gap_truncation_thresh=1.0,
+            sequence_gap_thresh=0.0,
+            reference_id=None,
+            reference_similarity_thresh=0.0,
+            sequence_similarity_thresh=1.0,
+            position_gap_thresh=1.0,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# FASTA header descriptions thread through filters and survive the npz        #
+# round-trip; legacy bundles without the new key still load.                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_preprocessing_preserves_descriptions_through_filters(tmp_path):
+    """`seq_descriptions` parallel to `seqids` survives every filter stage,
+    including a sequence-gap drop and a reference-similarity drop."""
+    fa = tmp_path / "filtered.fasta"
+    fa.write_text(
+        ">keepA OS=Species A\nACDEF\n"
+        ">keepB OS=Species B\nACDEF\n"
+        ">drop_for_gaps too gappy\n--D--\n"
+        ">far_from_ref species Z\nFEDCA\n"
+    )
+    sym_map = SymMap("ACDEF", "-")
+    _, msa_loaded, msa_ids, msa_descriptions, _, _, _ = load_msa(
+        str(fa), format="fasta", mapping=sym_map,
+    )
+
+    # Filter: drop the third sequence via sequence_gap, drop the fourth
+    # via reference-similarity to "keepA".
+    _, results = preprocess_msa(
+        msa_loaded, list(msa_ids),
+        mapping=sym_map,
+        gap_truncation_thresh=1.0,
+        sequence_gap_thresh=0.5,
+        reference_id="keepA",
+        reference_similarity_thresh=0.5,
+        sequence_similarity_thresh=1.0,
+        position_gap_thresh=1.0,
+        seq_descriptions=list(msa_descriptions),
+    )
+
+    retained_ids = list(results["retained_sequence_ids"])
+    retained_descs = results["retained_sequence_descriptions"]
+    assert retained_ids == ["keepA", "keepB"]
+    assert retained_descs == ["OS=Species A", "OS=Species B"]
+    # Confirm None contract: if no descriptions are passed, the output
+    # carries None (back-compat).
+    _, results_no_desc = preprocess_msa(
+        msa_loaded, list(msa_ids),
+        mapping=sym_map,
+        gap_truncation_thresh=1.0,
+        sequence_gap_thresh=0.5,
+        reference_id="keepA",
+        reference_similarity_thresh=0.5,
+        sequence_similarity_thresh=1.0,
+        position_gap_thresh=1.0,
+    )
+    assert results_no_desc["retained_sequence_descriptions"] is None
+
+
+def test_preprocessing_results_descriptions_round_trip(tmp_path):
+    """PreprocessingResults.save() persists descriptions and load()
+    reads them back identically."""
+    from mysca.results import PreprocessingResults
+    fa = tmp_path / "rt.fasta"
+    fa.write_text(
+        ">a OS=A\nACDEF\n"
+        ">b OS=B\nACDEF\n"
+    )
+    sym_map = SymMap("ACDEF", "-")
+    _, msa_loaded, msa_ids, msa_descriptions, _, n_excl, n_int = load_msa(
+        str(fa), format="fasta", mapping=sym_map,
+    )
+    msa, results_dict = preprocess_msa(
+        msa_loaded, list(msa_ids),
+        mapping=sym_map,
+        gap_truncation_thresh=1.0,
+        sequence_gap_thresh=1.0,
+        reference_id=None,
+        reference_similarity_thresh=0.0,
+        sequence_similarity_thresh=1.0,
+        position_gap_thresh=1.0,
+        seq_descriptions=list(msa_descriptions),
+    )
+    results = PreprocessingResults.from_preprocess_output(
+        msa, results_dict, sym_map=sym_map,
+    )
+    assert results.retained_sequence_descriptions == ["OS=A", "OS=B"]
+
+    outdir = tmp_path / "out"
+    results.save(str(outdir))
+    reloaded = PreprocessingResults.load(str(outdir))
+    assert reloaded.retained_sequence_descriptions == ["OS=A", "OS=B"]
+
+
+def test_preprocessing_results_load_legacy_bundle_without_descriptions(tmp_path):
+    """Legacy bundles produced before description preservation lack the
+    `retained_sequence_descriptions` key; load() must default to None."""
+    from mysca.results import (
+        PreprocessingResults, PREPROCESSING_RESULTS_FNAME,
+    )
+    # Build a minimal results bundle the way pre-step-6 mysca did.
+    outdir = tmp_path / "legacy"
+    outdir.mkdir()
+    np.savez(
+        outdir / PREPROCESSING_RESULTS_FNAME,
+        msa=np.array([[0, 1], [1, 0]], dtype=int),
+        retained_sequences=np.array([0, 1]),
+        retained_positions=np.array([0, 1]),
+        retained_sequence_ids=np.array(["a", "b"]),
+        sequence_weights=np.array([1.0, 1.0]),
+        fi0_pretruncation=np.array([0.0, 0.0]),
+    )
+    reloaded = PreprocessingResults.load(str(outdir))
+    assert reloaded.retained_sequence_descriptions is None
+
+
+# --------------------------------------------------------------------------- #
+# Per-input-sequence column-retention fraction (seq_retained_fraction).       #
+# --------------------------------------------------------------------------- #
+
+
+def test_seq_retained_fraction_hand_computable(tmp_path):
+    """Hand-computable check that the fraction is per-input-sequence
+    (sequence-side normalization), indexed in input order, and
+    includes sequences later dropped by sequence-level filters."""
+    fa = tmp_path / "input.fasta"
+    # 5 input sequences x 5 columns. With gap_truncation_thresh=0.4,
+    # col-gap freqs are: c0=0.2, c1=0.4, c2=0.4, c3=0.2, c4=0.4. Cols
+    # 1, 2, 4 fail `< 0.4` → dropped. Retained_positions = [0, 3].
+    # sequence_gap_thresh=0.5 then drops the all-gap row (e), but the
+    # fraction remains length-5 indexed by INPUT order.
+    fa.write_text(
+        ">a\nACDED\n"
+        ">b\nA-DED\n"
+        ">c\nAC-ED\n"
+        ">d\nACDE-\n"
+        ">e\n-----\n"
+    )
+    sym_map = SymMap("ACDE", "-")
+    _, msa_loaded, msa_ids, _, _, _, _ = load_msa(
+        str(fa), format="fasta", mapping=sym_map,
+    )
+
+    _, results = preprocess_msa(
+        msa_loaded, list(msa_ids),
+        mapping=sym_map,
+        gap_truncation_thresh=0.4,
+        sequence_gap_thresh=0.5,
+        reference_id=None,
+        reference_similarity_thresh=0.0,
+        sequence_similarity_thresh=1.0,
+        position_gap_thresh=1.0,
+    )
+    assert list(results["retained_positions"]) == [0, 3]
+
+    frac = results["seq_retained_fraction"]
+    assert frac.shape == (5,), f"expected length 5, got {frac.shape}"
+    # a: 5 residues; cols {0,3} → 2 retained → 2/5
+    assert np.isclose(frac[0], 2 / 5)
+    # b: 4 residues (col 1 is gap); cols {0,3} → 2 retained → 2/4
+    assert np.isclose(frac[1], 2 / 4)
+    # c: 4 residues (col 2 is gap); cols {0,3} → 2 retained → 2/4
+    assert np.isclose(frac[2], 2 / 4)
+    # d: 4 residues (col 4 is gap); cols {0,3} → 2 retained → 2/4
+    assert np.isclose(frac[3], 2 / 4)
+    # e: 0 non-gap residues → NaN. Note e was filtered at the
+    # sequence-gap step, but the fraction is still recorded by INPUT
+    # order.
+    assert np.isnan(frac[4])
+    assert len(frac) == len(msa_loaded)
+
+
+def test_seq_retained_fraction_partial_retention(tmp_path):
+    """When column filtering drops some residue-bearing positions for a
+    sequence, the fraction reflects partial retention (kept / total)."""
+    fa = tmp_path / "input.fasta"
+    # 5 columns. Column 1 has 3/4 gaps; column 3 has 3/4 gaps. Both
+    # exceed gap_truncation_thresh=0.5 and get dropped.
+    fa.write_text(
+        ">a\nACDED\n"  # has residues at all 5 cols
+        ">b\nA--ED\n"  # cols 1,2 gap
+        ">c\nA-C-D\n"  # cols 1,3 gap
+        ">d\nA-C-D\n"  # cols 1,3 gap
+    )
+    sym_map = SymMap("ACDE", "-")
+    _, msa_loaded, msa_ids, _, _, _, _ = load_msa(
+        str(fa), format="fasta", mapping=sym_map,
+    )
+
+    _, results = preprocess_msa(
+        msa_loaded, list(msa_ids),
+        mapping=sym_map,
+        gap_truncation_thresh=0.5,
+        sequence_gap_thresh=1.0,
+        reference_id=None,
+        reference_similarity_thresh=0.0,
+        sequence_similarity_thresh=1.0,
+        position_gap_thresh=1.0,
+    )
+    retained = results["retained_positions"]
+    # Sanity: only cols 0,2,4 survive the position_gap step.
+    assert list(retained) == [0, 2, 4]
+
+    frac = results["seq_retained_fraction"]
+    # a has 5 residues, kept 3 (at cols 0,2,4) → 3/5
+    assert np.isclose(frac[0], 3 / 5)
+    # b has 3 residues at cols 0,3,4. cols 0,4 retained → 2/3
+    assert np.isclose(frac[1], 2 / 3)
+    # c has 3 residues at cols 0,2,4. all retained → 3/3
+    assert np.isclose(frac[2], 1.0)
+    # d same as c → 1.0
+    assert np.isclose(frac[3], 1.0)
+
+
+def test_seq_retained_fraction_round_trips_through_save_load(tmp_path):
+    """PreprocessingResults.save() persists seq_retained_fraction and
+    load() reads it back identically."""
+    from mysca.results import PreprocessingResults
+    fa = tmp_path / "input.fasta"
+    fa.write_text(
+        ">a\nACDE\n"
+        ">b\nA-DE\n"
+    )
+    sym_map = SymMap("ACDE", "-")
+    _, msa_loaded, msa_ids, _, _, _, _ = load_msa(
+        str(fa), format="fasta", mapping=sym_map,
+    )
+    msa, results_dict = preprocess_msa(
+        msa_loaded, list(msa_ids),
+        mapping=sym_map,
+        gap_truncation_thresh=1.0,
+        sequence_gap_thresh=1.0,
+        reference_id=None,
+        reference_similarity_thresh=0.0,
+        sequence_similarity_thresh=1.0,
+        position_gap_thresh=1.0,
+    )
+    results = PreprocessingResults.from_preprocess_output(
+        msa, results_dict, sym_map=sym_map,
+    )
+    assert results.seq_retained_fraction is not None
+
+    outdir = tmp_path / "out"
+    results.save(str(outdir))
+    reloaded = PreprocessingResults.load(str(outdir))
+    assert reloaded.seq_retained_fraction is not None
+    np.testing.assert_allclose(
+        reloaded.seq_retained_fraction, results.seq_retained_fraction,
+    )
+
+
+def test_seq_retained_fraction_legacy_bundle_loads_as_none(tmp_path):
+    """Legacy bundles without the seq_retained_fraction key load with
+    seq_retained_fraction=None (back-compat)."""
+    from mysca.results import (
+        PreprocessingResults, PREPROCESSING_RESULTS_FNAME,
+    )
+    outdir = tmp_path / "legacy"
+    outdir.mkdir()
+    np.savez(
+        outdir / PREPROCESSING_RESULTS_FNAME,
+        msa=np.array([[0, 1], [1, 0]], dtype=int),
+        retained_sequences=np.array([0, 1]),
+        retained_positions=np.array([0, 1]),
+        retained_sequence_ids=np.array(["a", "b"]),
+        sequence_weights=np.array([1.0, 1.0]),
+        fi0_pretruncation=np.array([0.0, 0.0]),
+    )
+    reloaded = PreprocessingResults.load(str(outdir))
+    assert reloaded.seq_retained_fraction is None

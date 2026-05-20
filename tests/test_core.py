@@ -11,7 +11,15 @@ import numpy as np
 from mysca.io import load_msa
 from mysca.mappings import SymMap
 from mysca.preprocess import preprocess_msa
-from mysca.core import run_sca
+from mysca.core import (
+    run_sca,
+    _compute_fijab_v1,
+    _compute_fijab_v2,
+    _compute_fijab_v3,
+    _compute_fijab_v4_jax,
+    _compute_fijab_gpu,
+    _compute_eigvalsh_bootstrap_gpu,
+)
 # from mysca.helpers import map_msa_positions_to_sequence
 
 
@@ -212,12 +220,12 @@ def test_run_sca(
     if background_map is None:
         background_map = {s: 1 / len(symmap.aa2int) for s in symmap.aa2int}
     
-    msa_obj, msa_orig, msa_ids_orig, _ = load_msa(
+    msa_obj, msa_loaded, msa_ids_loaded, _, _, _, _ = load_msa(
         fa_fpath, format="fasta", mapping=symmap,
     )
 
     msa, preprocessing_results = preprocess_msa(
-        msa_orig, msa_ids_orig, 
+        msa_loaded, msa_ids_loaded, 
         mapping=symmap, 
         gap_truncation_thresh=gap_truncation_thresh,
         sequence_gap_thresh=sequence_gap_thresh,
@@ -253,3 +261,218 @@ def test_run_sca(
             # msg += f"     Got:\n{sca_res[key]}\n"
             errors.append(msg)
     assert not errors, "Errors occurred:\n{}".format("\n".join(errors))
+
+
+@pytest.mark.parametrize("nseq, npos, naas", [
+    (50, 12, 8),
+    (200, 25, 6),
+])
+def test_compute_fijab_kernels_agree(nseq, npos, naas):
+    """v1 (numpy double-loop), v2 (JAX), and v3 (tensordot, the
+    default) must produce identical fijab tensors up to fp64
+    rounding on synthetic input. Locks in the contract that the
+    fast tensordot path doesn't drift from the reference v1 kernel.
+    """
+    rng = np.random.default_rng(seed=12345)
+    xmsa = rng.integers(0, 2, size=(nseq, npos, naas)).astype(bool)
+    # Ensure no all-zero rows (each "sequence" should have at least
+    # one symbol per position so the contraction isn't degenerate).
+    for i in range(nseq):
+        for j in range(npos):
+            if not xmsa[i, j].any():
+                xmsa[i, j, rng.integers(0, naas)] = True
+    ws_norm = rng.random(nseq)
+    ws_norm = ws_norm / ws_norm.sum()
+    lam = 0.03
+    nsyms = naas + 1
+
+    f1 = _compute_fijab_v1(xmsa, ws_norm, lam, nsyms)
+    f2 = _compute_fijab_v2(xmsa, ws_norm, lam, nsyms)
+    f3 = _compute_fijab_v3(xmsa, ws_norm, lam, nsyms)
+    f4 = _compute_fijab_v4_jax(xmsa, ws_norm, lam, nsyms)
+    # GPU kernel falls back to v3 internally on no-GPU machines (with a
+    # WARNING); on GPU-equipped machines this exercises torch.tensordot
+    # at fp64. Either way the answer must match v1.
+    f5 = _compute_fijab_gpu(xmsa, ws_norm, lam, nsyms)
+
+    assert np.allclose(f1, f3, atol=1e-12), (
+        f"v3 disagrees with v1; max abs diff = {np.max(np.abs(f1 - f3)):.3e}"
+    )
+    assert np.allclose(f1, f2, atol=1e-12), (
+        f"v2 disagrees with v1; max abs diff = {np.max(np.abs(f1 - f2)):.3e}"
+    )
+    assert np.allclose(f1, f4, atol=1e-12), (
+        f"v4_jax disagrees with v1; max abs diff = {np.max(np.abs(f1 - f4)):.3e}"
+    )
+    assert np.allclose(f1, f5, atol=1e-10), (
+        f"gpu kernel disagrees with v1; max abs diff = "
+        f"{np.max(np.abs(f1 - f5)):.3e}"
+    )
+    # v3 must preserve the (j, i) symmetry of v1 — fijab[j, i, b, a] is
+    # the transpose of fijab[i, j, a, b]. v1 enforces this explicitly;
+    # tensordot does it implicitly. Verify.
+    assert np.allclose(f3, f3.transpose(1, 0, 3, 2)), (
+        "v3 fijab is not symmetric under (i,a)<->(j,b) swap"
+    )
+
+
+def test_bootstrap_gpu_eigvals_match_per_iter():
+    """The batched-GPU bootstrap helper must produce eigenvalues that
+    rank-match the per-iter (CPU/v3) path on the same input.
+
+    On no-GPU machines the helper raises RuntimeError; the test then
+    just exercises the per-iter path and verifies its own self-
+    consistency (which is trivially true). On GPU machines it
+    additionally asserts the batched + per-iter paths agree on each
+    iter's eigenvalues within fp64 tolerance.
+
+    Why we test eigenvalues directly (not kstar): kstar depends on a
+    statistical-significance threshold that's noisy on small synthetic
+    inputs. Eigenvalue-array allclose is the right contract — kstar
+    stability follows.
+    """
+    rng = np.random.default_rng(seed=20260427)
+    nseq, npos, naas = 60, 10, 6
+    nsyms = naas + 1
+    lam = 0.03
+    qa = np.full(naas, 1.0 / naas)
+
+    # Build a synthetic int MSA in [1..naas] (gap=0); construct the
+    # one-hot batch of `B` shuffled iters by permuting columns.
+    msa = rng.integers(1, naas + 1, size=(nseq, npos)).astype(np.int8)
+    B = 4
+    shuffled = np.empty((B, nseq, npos), dtype=msa.dtype)
+    for b in range(B):
+        # Same per-column shuffling shape as run_sca's shuffle_columns.
+        shuf = msa.copy()
+        for col in range(npos):
+            shuf[:, col] = rng.permutation(shuf[:, col])
+        shuffled[b] = shuf
+
+    # One-hot encode (drop the gap channel).
+    onehot = np.eye(nsyms, dtype=bool)[shuffled]
+    xmsa_batch = np.delete(onehot, 0, axis=-1).astype(bool)
+    weights = rng.random(nseq)
+    ws_norm = weights / weights.sum()
+
+    # Per-iter CPU reference: run the same Cij_corr derivation per iter
+    # via run_sca, take eigvalsh, sort descending.
+    per_iter_evals = np.empty((B, npos))
+    for b in range(B):
+        res = run_sca(
+            xmsa_batch[b], weights, background_map={},
+            background_arr=qa, regularization=lam, return_keys=["Cij_corr"],
+            pbar=False,
+        )
+        evals = np.linalg.eigvalsh(res["Cij_corr"])
+        per_iter_evals[b] = np.flip(evals)  # descending
+
+    try:
+        batched_evals = _compute_eigvalsh_bootstrap_gpu(
+            xmsa_batch, ws_norm, qa=qa, lam=lam, nsyms=nsyms,
+        )
+    except RuntimeError:
+        pytest.skip("No GPU available for batched-bootstrap test.")
+
+    assert batched_evals.shape == per_iter_evals.shape
+    # GPU path may diverge in low-order bits; tolerance loose enough to
+    # tolerate non-deterministic reductions on some accelerators while
+    # still catching real bugs (sign flips, broadcast mismatches, etc.).
+    assert np.allclose(batched_evals, per_iter_evals, atol=1e-9), (
+        f"batched-GPU eigenvalues disagree with per-iter; "
+        f"max abs diff = {np.max(np.abs(batched_evals - per_iter_evals)):.3e}"
+    )
+
+
+def test_resolve_torch_dtype_choices():
+    """resolve_torch_dtype maps each precision choice to the expected
+    torch dtype and rejects unknown values."""
+    pytest.importorskip("torch")
+    import torch
+    from mysca._acceleration import (
+        resolve_torch_dtype, PRECISION_CHOICES,
+    )
+    expected = {
+        "fp64": torch.float64,
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+    }
+    for p in PRECISION_CHOICES:
+        assert resolve_torch_dtype(p) is expected[p]
+    with pytest.raises(ValueError, match="Unknown precision"):
+        resolve_torch_dtype("bf16")
+
+
+def test_adapt_dtype_for_device_downgrades_fp64_on_mps(caplog):
+    """MPS doesn't support float64 — adapt_dtype_for_device must
+    downgrade fp64 to fp32 on MPS and emit a WARNING. Other dtypes /
+    devices pass through unchanged."""
+    pytest.importorskip("torch")
+    import logging
+    import torch
+    from mysca._acceleration import adapt_dtype_for_device
+
+    mps = torch.device("mps")
+    cuda = torch.device("cuda")
+    cpu = torch.device("cpu")
+
+    # configure_logging() in upstream entrypoints sets propagate=False on
+    # the mysca package logger so library handlers don't double-emit; if
+    # any prior test in the session triggered that, caplog (attached to
+    # root) cannot see records from mysca._acceleration. Force-propagate
+    # for the duration of the assertion.
+    mysca_logger = logging.getLogger("mysca")
+    prev_propagate = mysca_logger.propagate
+    mysca_logger.propagate = True
+    try:
+        with caplog.at_level("WARNING", logger="mysca._acceleration"):
+            out = adapt_dtype_for_device(torch.float64, mps, kind="fijab")
+    finally:
+        mysca_logger.propagate = prev_propagate
+
+    assert out is torch.float32
+    assert any(
+        "MPS backend does not support float64" in r.getMessage()
+        and "fijab" in r.getMessage()
+        for r in caplog.records
+    )
+
+    # fp32 / fp16 on MPS pass through.
+    assert adapt_dtype_for_device(torch.float32, mps) is torch.float32
+    assert adapt_dtype_for_device(torch.float16, mps) is torch.float16
+
+    # CUDA / CPU keep fp64.
+    assert adapt_dtype_for_device(torch.float64, cuda) is torch.float64
+    assert adapt_dtype_for_device(torch.float64, cpu) is torch.float64
+
+
+def test_compute_fijab_gpu_precision_match():
+    """The fp32 GPU kernel must agree with the fp64 GPU kernel within
+    ~1e-5 relative tolerance. Skips when no GPU is available (the
+    fallback CPU path ignores precision)."""
+    from mysca._acceleration import detect_device
+    try:
+        device = detect_device()
+    except Exception:
+        pytest.skip("torch not available")
+    if device.type == "cpu":
+        pytest.skip("No GPU available for fp32-vs-fp64 GPU kernel test.")
+
+    rng = np.random.default_rng(seed=20260428)
+    nseq, npos, naas = 80, 10, 6
+    xmsa = np.zeros((nseq, npos, naas), dtype=bool)
+    msa_int = rng.integers(0, naas, size=(nseq, npos))
+    for i in range(nseq):
+        for j in range(npos):
+            xmsa[i, j, msa_int[i, j]] = True
+    ws_norm = rng.random(nseq)
+    ws_norm = ws_norm / ws_norm.sum()
+    lam = 0.03
+    nsyms = naas + 1
+
+    f64 = _compute_fijab_gpu(xmsa, ws_norm, lam, nsyms, precision="fp64")
+    f32 = _compute_fijab_gpu(xmsa, ws_norm, lam, nsyms, precision="fp32")
+    assert np.allclose(f32, f64, rtol=1e-4, atol=1e-6), (
+        f"fp32 GPU fijab disagrees with fp64 beyond fp32 precision; "
+        f"max abs diff = {np.max(np.abs(f32 - f64)):.3e}"
+    )

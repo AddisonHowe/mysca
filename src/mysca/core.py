@@ -3,6 +3,7 @@
 """
 
 import logging
+import warnings
 
 import numpy as np
 from numpy.typing import NDArray
@@ -10,6 +11,7 @@ import tqdm
 
 import jax
 jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
 
 from mysca.mappings import SymMap, DEFAULT_MAP
 
@@ -28,6 +30,8 @@ def run_sca(
         leave_pbar: bool = True,
         verbosity: int = 1,
         use_jax: bool = False,
+        freq_method: str | None = None,
+        precision: str = "fp64",
 ):
     """Run SCA algorithm on given MSA matrix
 
@@ -57,19 +61,41 @@ def run_sca(
     nsyms = naas + 1
 
     # Compute positional conservation
+    logger.info(
+        "Frequency regularization: λ=%g, nsyms=%d (uniform pseudocount "
+        "λ/nsyms=%g per amino-acid).", lam, nsyms, lam / nsyms,
+    )
     ws_norm = ws / ws.sum()
     fi0 = 1 - np.sum(ws[:,None,None] * xmsa, axis=(0,2)) / ws.sum()
-    if np.any(np.isclose(fi0, 0)):
-        # TODO: handle this
-        logger.debug("0 value encountered in SCA calculation of fi0!")
+    n_fi0_zero = int(np.sum(np.isclose(fi0, 0)))
+    if n_fi0_zero > 0:
+        # fi0 ≈ 0 just means "this column has effectively no gaps after
+        # weighting" — the normal state of any well-conserved column. The
+        # only fi0 consumer in run_sca is the Di term below (line ~108),
+        # which already guards the case via np.where(fi0 > 0, ..., 0)
+        # under errstate('ignore'). DEBUG-only diagnostic so a future
+        # NaN-chase has a breadcrumb without polluting healthy runs.
+        logger.debug(
+            "fi0 ≈ 0 at %d position(s) (well-conserved columns); "
+            "downstream Di guards this case.", n_fi0_zero,
+        )
     fia = (1 - lam) * np.sum(ws_norm[:,None,None] * xmsa, axis=0) + lam / nsyms
 
-    # Compute correlated conservation
+    # Resolve fijab kernel. freq_method is the user-facing surface
+    # ("numpy" | "jax" | "gpu"); use_jax is the deprecated legacy flag.
+    freq_method = _resolve_freq_method(freq_method=freq_method, use_jax=use_jax)
+    fijab_version = _FREQ_METHOD_TO_VERSION[freq_method]
+
+    # Compute correlated conservation. The default (numpy -> v3,
+    # tensordot) is ~9x faster than v1 (numpy double-loop) on
+    # SH3-scale input with bit-stable fp64 numerics; see
+    # docs/.claude_sessions/session_2026-04-27_scacore_perf_phase1.md.
     fijab = compute_fijab(
-        xmsa, ws_norm, lam, nsyms, 
-        pbar=pbar, 
+        xmsa, ws_norm, lam, nsyms,
+        pbar=pbar,
         leave_pbar=leave_pbar,
-        version="v2" if use_jax else "v1"
+        version=fijab_version,
+        precision=precision,
     )
 
     if qa is None:
@@ -164,9 +190,46 @@ def run_ica(
     return None, np.max(np.abs(dw))
 
 
+# Mapping from user-facing --freq_method values to internal compute_fijab
+# version codes. Centralized so run_sca and compute_fijab agree.
+FREQ_METHOD_CHOICES = ("numpy", "jax", "gpu")
+_FREQ_METHOD_TO_VERSION = {
+    "numpy": "v3",
+    "jax":   "v4",
+    "gpu":   "v5",
+}
+
+
+def _resolve_freq_method(*, freq_method, use_jax):
+    """Resolve the final freq_method given both `freq_method` (new) and
+    `use_jax` (deprecated). Emits a DeprecationWarning if `use_jax`
+    is set; freq_method wins on conflict."""
+    if freq_method is None:
+        if use_jax:
+            warnings.warn(
+                "`use_jax=True` is deprecated; pass `freq_method='jax'` "
+                "instead. Routing to freq_method='jax' for now.",
+                DeprecationWarning, stacklevel=3,
+            )
+            return "jax"
+        return "numpy"
+    if freq_method not in _FREQ_METHOD_TO_VERSION:
+        raise ValueError(
+            f"Unknown freq_method: {freq_method!r}. Choices: "
+            f"{FREQ_METHOD_CHOICES}"
+        )
+    if use_jax:
+        warnings.warn(
+            "Both `freq_method` and `use_jax` were set; `use_jax` is "
+            "deprecated and is being ignored.",
+            DeprecationWarning, stacklevel=3,
+        )
+    return freq_method
+
+
 def compute_fijab(
-        xmsa, ws_norm, lam, nsyms, pbar=False, leave_pbar=False, 
-        version="v1",
+        xmsa, ws_norm, lam, nsyms, pbar=False, leave_pbar=False,
+        version="v3", precision="fp64",
 ):
     if version == "v1":
         return _compute_fijab_v1(
@@ -175,6 +238,14 @@ def compute_fijab(
     elif version == "v2":
         return _compute_fijab_v2(
             xmsa, ws_norm, lam, nsyms, pbar=pbar, leave_pbar=leave_pbar
+        )
+    elif version == "v3":
+        return _compute_fijab_v3(xmsa, ws_norm, lam, nsyms)
+    elif version == "v4":
+        return _compute_fijab_v4_jax(xmsa, ws_norm, lam, nsyms)
+    elif version == "v5":
+        return _compute_fijab_gpu(
+            xmsa, ws_norm, lam, nsyms, precision=precision,
         )
     else:
         raise RuntimeError(f"Unknown version to compute fijab: {version}")
@@ -203,7 +274,7 @@ def _compute_fijab_v2(xmsa, ws_norm, lam, nsyms, pbar=False, leave_pbar=False):
     @jax.jit
     def compute_f(ci, cj, ws_norm, lam, nsyms, regterm):
         return (1 - lam) * (ci.T @ (ws_norm[:, None] * cj)) + regterm
-    
+
     for i in tqdm.trange(npos, disable=not pbar, leave=leave_pbar):
         ci = xmsa[:,i,:]
         for j in range(i, npos):
@@ -216,3 +287,213 @@ def _compute_fijab_v2(xmsa, ws_norm, lam, nsyms, pbar=False, leave_pbar=False):
             fijab[i,j,:,:] = f
             fijab[j,i,:,:] = f.T
     return fijab
+
+
+def _compute_fijab_v3(xmsa, ws_norm, lam, nsyms):
+    """Vectorized tensordot equivalent of v1.
+
+    Roughly 9x faster than v1 on SH3-scale input (npos=62) with
+    bit-stable fp64 numerics (max abs diff vs v1 ~1e-16). Replaces
+    v1's `O(npos^2)` Python-driven inner loops with a single
+    `np.tensordot` over the sequence axis. Memory footprint is the
+    two operands plus the result — no large intermediate.
+
+    Naive `np.einsum('s,sia,sjb->ijab', ...)` (without `optimize=`)
+    materializes a `(nseq, npos, naas, npos, naas)` intermediate and
+    is materially slower than v1 on small npos; that path was tried
+    and rejected. tensordot avoids the issue because numpy contracts
+    the sequence axis directly.
+    """
+    npos = xmsa.shape[1]
+    xf = xmsa.astype(np.float64, copy=False)
+    weighted = ws_norm[:, None, None] * xf
+    # tensordot returns shape (i, a, j, b); transpose to (i, j, a, b)
+    # to match v1's layout.
+    fijab = np.tensordot(weighted, xf, axes=([0], [0])).transpose(0, 2, 1, 3)
+    fijab *= (1.0 - lam)
+    diag = np.eye(npos, dtype=bool)
+    fijab[~diag] += lam / (nsyms * nsyms)
+    fijab[diag] += lam / nsyms
+    return fijab
+
+
+@jax.jit
+def _fijab_jax_kernel(xf, ws_norm, lam, reg_diag, reg_offdiag):
+    weighted = ws_norm[:, None, None] * xf
+    fijab = jnp.tensordot(weighted, xf, axes=([0], [0])).transpose(0, 2, 1, 3)
+    fijab = fijab * (1.0 - lam)
+    npos = xf.shape[1]
+    diag = jnp.eye(npos, dtype=bool)
+    return jnp.where(
+        diag[:, :, None, None],
+        fijab + reg_diag,
+        fijab + reg_offdiag,
+    )
+
+
+def _compute_fijab_v4_jax(xmsa, ws_norm, lam, nsyms):
+    """JAX-jitted equivalent of v3.
+
+    The whole tensordot + regularization is lifted under `jax.jit` so
+    JAX can compile and (on accelerator-equipped backends) execute it
+    on-device. Comparable speed to v3 on CPU; the GPU path lives in
+    `_compute_fijab_gpu` so this stays a CPU-flavored alternative
+    for users on JAX-only setups.
+
+    Numerics match v1/v3 within fp64 tolerance; verified by
+    tests/test_core.py::test_compute_fijab_kernels_agree.
+    """
+    xf = jnp.asarray(xmsa, dtype=jnp.float64)
+    ws_jnp = jnp.asarray(ws_norm, dtype=jnp.float64)
+    fijab = _fijab_jax_kernel(
+        xf, ws_jnp,
+        float(lam),
+        float(lam / nsyms),
+        float(lam / (nsyms * nsyms)),
+    )
+    return np.asarray(fijab)
+
+
+def _compute_fijab_gpu(xmsa, ws_norm, lam, nsyms, *, precision="fp64"):
+    """torch GPU equivalent of v3.
+
+    Lazy-imports torch and uses ``torch.tensordot`` on the first
+    available accelerator (CUDA / MPS / XPU). On no-GPU detection,
+    logs a WARNING and falls back to ``_compute_fijab_v3`` — same
+    graceful-fallback pattern as ``_compute_weights_gpu`` in
+    ``mysca.preprocess``.
+
+    `precision` selects the on-device floating-point dtype: ``fp64``
+    (default, bit-stable vs the CPU path), ``fp32`` (~2× faster on
+    most GPUs, ~7-decimal precision — adequate for routine
+    Cij_corr/eigvalsh use), or ``fp16`` (highest throughput on TF32 /
+    half-precision tensor cores; ~10⁻³ relative precision —
+    numerically risky for downstream eigvalsh on small eigenvalues,
+    treat as preview-only). MPS does not support fp64; on Apple
+    Silicon, fp64 is auto-downgraded to fp32 with a WARNING.
+    """
+    from mysca._acceleration import (
+        adapt_dtype_for_device, detect_device, resolve_torch_dtype,
+    )
+    import torch
+
+    device = detect_device()
+    if device.type == "cpu":
+        logger.warning(
+            "No GPU device found; falling back to CPU tensordot "
+            "(_compute_fijab_v3)."
+        )
+        return _compute_fijab_v3(xmsa, ws_norm, lam, nsyms)
+
+    dtype = adapt_dtype_for_device(
+        resolve_torch_dtype(precision), device, kind="fijab",
+    )
+
+    npos = xmsa.shape[1]
+    xf = torch.as_tensor(np.asarray(xmsa, dtype=np.float64),
+                         dtype=dtype, device=device)
+    ws_t = torch.as_tensor(np.asarray(ws_norm, dtype=np.float64),
+                           dtype=dtype, device=device)
+    weighted = ws_t[:, None, None] * xf
+    fijab = torch.tensordot(weighted, xf, dims=([0], [0])).permute(0, 2, 1, 3)
+    fijab = fijab * (1.0 - lam)
+    diag = torch.eye(npos, dtype=torch.bool, device=device)
+    reg_diag = torch.tensor(lam / nsyms, dtype=dtype, device=device)
+    reg_off = torch.tensor(lam / (nsyms * nsyms), dtype=dtype,
+                           device=device)
+    fijab = torch.where(diag[:, :, None, None],
+                        fijab + reg_diag, fijab + reg_off)
+    # Move to CPU before promoting back to float64 — MPS doesn't support
+    # fp64, so a `.to(float64)` while still on-device would crash there.
+    # Downstream pipeline assumes fp64 for Cij_corr / eigvalsh / bootstrap.
+    return fijab.cpu().to(torch.float64).numpy()
+
+
+def _compute_eigvalsh_bootstrap_gpu(
+        xmsa_batch, ws_norm, *, qa, lam, nsyms, precision="fp64",
+):
+    """Batched GPU bootstrap kernel.
+
+    Takes a stack of one-hot-encoded shuffled MSAs (shape
+    ``(B, nseq, npos, naas)``) and returns the descending-sorted
+    eigenvalues of each iter's `Cij_corr` (shape ``(B, npos)``).
+
+    Lifts the full per-iter pipeline onto torch:
+        fia -> fijab -> Cijab_raw -> phi_ia -> Cijab_corr
+            -> Cij_corr -> eigvalsh
+    so intermediate tensors stay on the device across the batch.
+
+    Raises:
+        RuntimeError: when no GPU is detected. Caller is expected to
+            fall back to the per-iter CPU path.
+    """
+    from mysca._acceleration import (
+        adapt_dtype_for_device, detect_device, resolve_torch_dtype,
+    )
+    import torch
+
+    device = detect_device()
+    if device.type == "cpu":
+        raise RuntimeError(
+            "No GPU device found; "
+            "_compute_eigvalsh_bootstrap_gpu cannot run."
+        )
+
+    dtype = adapt_dtype_for_device(
+        resolve_torch_dtype(precision), device, kind="bootstrap",
+    )
+    # eigvalsh requires fp32+ on most backends and is numerically
+    # treacherous in fp16; promote to fp32 for the eigendecomposition
+    # while keeping the cheap fijab/Cij_corr ops in the chosen dtype.
+    # On MPS, eig_dtype additionally cannot exceed fp32 (already
+    # enforced by adapt_dtype_for_device above).
+    eig_dtype = torch.float32 if dtype == torch.float16 else dtype
+
+    B, nseq, npos, naas = xmsa_batch.shape
+    xf = torch.as_tensor(
+        np.asarray(xmsa_batch, dtype=np.float64),
+        dtype=dtype, device=device,
+    )
+    ws_t = torch.as_tensor(
+        np.asarray(ws_norm, dtype=np.float64),
+        dtype=dtype, device=device,
+    )
+    qa_t = torch.as_tensor(
+        np.asarray(qa, dtype=np.float64),
+        dtype=dtype, device=device,
+    )
+
+    # fia[b, p, a] = (1-lam) * sum_s ws_norm[s] * xf[b, s, p, a] + lam/nsyms
+    fia = (1.0 - lam) * torch.einsum('s,bspa->bpa', ws_t, xf) + (lam / nsyms)
+
+    # fijab[b, i, j, a, b'] = (1-lam) * sum_s ws_norm[s] * xf[b,s,i,a] * xf[b,s,j,b']
+    weighted = ws_t[None, :, None, None] * xf  # (B, S, P, A)
+    fijab = torch.einsum('bspa,bsqc->bpqac', weighted, xf)
+    fijab = fijab * (1.0 - lam)
+    diag = torch.eye(npos, dtype=torch.bool, device=device)
+    reg_diag = lam / nsyms
+    reg_off = lam / (nsyms * nsyms)
+    fijab = torch.where(
+        diag[None, :, :, None, None],
+        fijab + reg_diag, fijab + reg_off,
+    )
+
+    # Cijab_raw[b, i, j, a, b'] = fijab[b, i, j, a, b'] - fia[b, i, a] * fia[b, j, b']
+    Cijab_raw = fijab - fia[:, :, None, :, None] * fia[:, None, :, None, :]
+    # phi_ia[b, p, a] = log((fia*(1-qa)) / ((1-fia)*qa))
+    phi_ia = torch.log((fia * (1.0 - qa_t)) / ((1.0 - fia) * qa_t))
+    Cijab_corr = (
+        phi_ia[:, :, None, :, None] * phi_ia[:, None, :, None, :] * Cijab_raw
+    )
+    # Cij_corr[b, i, j] = sqrt(sum_{a,b'} Cijab_corr[b, i, j, a, b']^2)
+    Cij_corr = torch.sqrt(torch.sum(Cijab_corr ** 2, dim=(-1, -2)))
+
+    # Batched symmetric eigvalsh; ascending order. Flip to descending.
+    # Promote to eig_dtype (fp32 minimum) — eigvalsh on fp16 is unstable
+    # and unsupported on most backends.
+    evals_asc = torch.linalg.eigvalsh(Cij_corr.to(eig_dtype))  # (B, P)
+    evals_desc = torch.flip(evals_asc, dims=[-1])
+    # Move to CPU before promoting to float64 — MPS doesn't support
+    # fp64, so `.to(float64)` on-device would crash there. Downstream
+    # numerics (kstar selection, cutoff comparisons) expect fp64.
+    return evals_desc.cpu().to(torch.float64).numpy()

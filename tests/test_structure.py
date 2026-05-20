@@ -240,7 +240,7 @@ def test_project_pdb_in_sample_matches_ic_residues_per_seq(
     sca = SCAResults.load(sca_dir)
 
     seq_id = prep.retained_sequence_ids[0]
-    donor = next(r for r in prep.msa_obj_orig if r.id == seq_id)
+    donor = next(r for r in prep.msa_obj_loaded if r.id == seq_id)
     raw = str(donor.seq).replace("-", "")
 
     # Residue numbers 10..10+L-1 so the PDB-resi→raw-resi offset is
@@ -292,7 +292,7 @@ def test_project_groups_to_pdb_length_guard(prep_and_sca_dirs, tmp_path):
     prep_dir, sca_dir = prep_and_sca_dirs
     prep = PreprocessingResults.load(prep_dir)
     seq_id = prep.retained_sequence_ids[0]
-    donor = next(r for r in prep.msa_obj_orig if r.id == seq_id)
+    donor = next(r for r in prep.msa_obj_loaded if r.id == seq_id)
     raw = str(donor.seq).replace("-", "")
 
     pdb_path = str(tmp_path / "ok.pdb")
@@ -326,7 +326,7 @@ def test_sca_structure_cli_single_pdb(prep_and_sca_dirs, tmp_path):
     prep = PreprocessingResults.load(prep_dir)
 
     seq_id = prep.retained_sequence_ids[0]
-    donor = next(r for r in prep.msa_obj_orig if r.id == seq_id)
+    donor = next(r for r in prep.msa_obj_loaded if r.id == seq_id)
     raw = str(donor.seq).replace("-", "")
 
     pdb_path = str(tmp_path / f"{seq_id}.pdb")
@@ -369,7 +369,7 @@ def test_sca_structure_cli_seq_map(prep_and_sca_dirs, tmp_path):
     chosen_ids = list(prep.retained_sequence_ids[:2])
     tsv_lines = []
     for sid in chosen_ids:
-        donor = next(r for r in prep.msa_obj_orig if r.id == sid)
+        donor = next(r for r in prep.msa_obj_loaded if r.id == sid)
         raw = str(donor.seq).replace("-", "")
         pdb_path = tmp_path / f"{sid}.pdb"
         _write_minimal_pdb(raw, str(pdb_path))
@@ -466,7 +466,7 @@ def test_cli_uniprot_ids_e2e(prep_and_sca_dirs, tmp_path):
     prep_dir, sca_dir = prep_and_sca_dirs
     prep = PreprocessingResults.load(prep_dir)
     seq_id = prep.retained_sequence_ids[0]
-    donor = next(r for r in prep.msa_obj_orig if r.id == seq_id)
+    donor = next(r for r in prep.msa_obj_loaded if r.id == seq_id)
     raw = str(donor.seq).replace("-", "")
 
     pdb_dir = tmp_path / "pdbs"
@@ -496,3 +496,92 @@ def test_cli_uniprot_ids_e2e(prep_and_sca_dirs, tmp_path):
     assert os.path.isfile(data[0]["pdb_path"])
     # The SIFTS cache is honored (P_FAKE.json written under cache_dir).
     assert (cache_dir / "P_FAKE.json").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# --seq_metadata pass-through in sca-structure: persisted at the outdir,      #
+# forwarded to every per-PDB sca-project call, never inlined in the JSON.    #
+# --------------------------------------------------------------------------- #
+
+
+def test_sca_structure_cli_seq_metadata_pass_through(
+    prep_and_sca_dirs, tmp_path,
+):
+    """In batch mode, --seq_metadata is copied verbatim to
+    <outdir>/sequence_metadata.tsv and structure_projection.json does
+    NOT inline metadata columns."""
+    prep_dir, sca_dir = prep_and_sca_dirs
+    prep = PreprocessingResults.load(prep_dir)
+
+    chosen_ids = list(prep.retained_sequence_ids[:2])
+    tsv_lines = []
+    for sid in chosen_ids:
+        donor = next(r for r in prep.msa_obj_loaded if r.id == sid)
+        raw = str(donor.seq).replace("-", "")
+        pdb_path = tmp_path / f"{sid}.pdb"
+        _write_minimal_pdb(raw, str(pdb_path))
+        tsv_lines.append(f"{sid}\t{pdb_path.resolve()}\n")
+    seq_map = tmp_path / "map.tsv"
+    seq_map.write_text("".join(tsv_lines))
+
+    md = tmp_path / "metadata.tsv"
+    md.write_text(
+        "seq_id\tkingdom\ttaxid\n"
+        f"{chosen_ids[0]}\tEukaryota\t9606\n"
+        f"{chosen_ids[1]}\tBacteria\t562\n"
+    )
+
+    out_dir = str(tmp_path / "structure_md_out")
+    args = structure_parse_args([
+        "--seq_map", str(seq_map),
+        "--preprocessing", prep_dir,
+        "--scacore", sca_dir,
+        "--seq_metadata", str(md),
+        "-o", out_dir,
+        "-v", "0",
+    ])
+    structure_main(args)
+
+    persisted = os.path.join(out_dir, "sequence_metadata.tsv")
+    assert os.path.isfile(persisted)
+    with open(persisted) as f:
+        copied = f.read()
+    assert copied == md.read_text()
+
+    with open(os.path.join(out_dir, "structure_projection.json")) as f:
+        data = json.load(f)
+    for entry in data:
+        seq_proj = entry["sequence_projection"]
+        assert "kingdom" not in seq_proj
+        assert "taxid" not in seq_proj
+        assert "kingdom" not in entry
+        assert "taxid" not in entry
+
+
+def test_sca_structure_cli_seq_metadata_missing_seq_id_column_raises(
+    prep_and_sca_dirs, tmp_path,
+):
+    """Parity with sca-project: a metadata TSV without `seq_id` errors
+    out when the underlying sca-project call validates it."""
+    prep_dir, sca_dir = prep_and_sca_dirs
+    prep = PreprocessingResults.load(prep_dir)
+    sid = prep.retained_sequence_ids[0]
+    donor = next(r for r in prep.msa_obj_loaded if r.id == sid)
+    raw = str(donor.seq).replace("-", "")
+    pdb_path = str(tmp_path / f"{sid}.pdb")
+    _write_minimal_pdb(raw, pdb_path)
+
+    bad_md = tmp_path / "bad.tsv"
+    bad_md.write_text("identifier\tkingdom\nfoo\tEukaryota\n")
+
+    args = structure_parse_args([
+        "-s", pdb_path,
+        "--seq_id", sid,
+        "--preprocessing", prep_dir,
+        "--scacore", sca_dir,
+        "--seq_metadata", str(bad_md),
+        "-o", str(tmp_path / "out"),
+        "-v", "0",
+    ])
+    with pytest.raises(ValueError, match="seq_id"):
+        structure_main(args)

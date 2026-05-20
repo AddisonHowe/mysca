@@ -1,7 +1,7 @@
 """Pre-alignment stage: cluster and align raw (unaligned) FASTA.
 
-Provides thin wrappers around external tools (mmseqs2, MAFFT, Clustal Omega)
-that shell out via subprocess. The public surface is `run_cluster` and
+Provides thin wrappers around external tools (mmseqs2, MAFFT, Clustal Omega,
+FAMSA) that shell out via subprocess. The public surface is `run_cluster` and
 `run_align`, dispatched through the `CLUSTERERS` and `ALIGNERS` registries so
 additional tools can be added without changing the CLI.
 
@@ -38,7 +38,7 @@ def _resolve_bin(binary_name: str, override: str | None = None) -> str:
         raise FileNotFoundError(
             f"Required binary {candidate!r} not found on PATH. "
             f"Make it available on PATH (e.g. via "
-            f"`conda install -c bioconda {binary_name}`) or pass an explicit "
+            f"`conda install -c conda-forge -c bioconda {binary_name}`) or pass an explicit "
             f"path via the corresponding --*_bin CLI flag."
         )
     logger.info("Resolved %s binary to %s", binary_name, resolved)
@@ -317,14 +317,101 @@ def _align_clustalo(
     return {"n_in": n_in, "n_out": n_out, "elapsed_s": elapsed}
 
 
+_FAMSA_GT_CHOICES = ("sl", "upgma", "nj")
+
+
+def _align_famsa(
+    in_fasta: str,
+    out_path: str,
+    *,
+    threads: int,
+    bin_path: str | None,
+    extra_args: Iterable[str],
+    output_format: str,
+    aligner_kwargs: dict | None = None,
+) -> dict:
+    kwargs = dict(aligner_kwargs or {})
+    guidetree_out_flag = _coerce_bool(kwargs.pop("guidetree_out", False))
+    gt = kwargs.pop("gt", "sl")
+    medoidtree_flag = _coerce_bool(kwargs.pop("medoidtree", False))
+    if kwargs:
+        raise ValueError(
+            f"Unknown --align_args keys for famsa: {sorted(kwargs)}. "
+            f"Known: guidetree_out, gt, medoidtree."
+        )
+    if gt not in _FAMSA_GT_CHOICES:
+        raise ValueError(
+            f"gt must be one of {list(_FAMSA_GT_CHOICES)}; got {gt!r}"
+        )
+
+    famsa = _resolve_bin("famsa", override=bin_path)
+    n_in = _count_fasta(in_fasta)
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    logger.info(
+        "Aligning %d sequences with FAMSA "
+        "(threads=%d, output_format=%s, gt=%s, medoidtree=%s)",
+        n_in, threads, output_format, gt, medoidtree_flag,
+    )
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # FAMSA writes FASTA natively. If the caller wants Stockholm, run FAMSA
+    # into a temp file and convert with Bio.AlignIO. `-keep-duplicates` is
+    # always passed so the wrapper preserves the input record set
+    # explicitly (parity with MAFFT/Clustal Omega and the n_in == n_out
+    # pipeline invariant); without it, FAMSA dedupes internally and
+    # restores duplicates after alignment, but we don't rely on that.
+    if output_format == "fasta":
+        fasta_sink = out_path
+        tmp_fasta = None
+    else:
+        tmp_fd, tmp_fasta = tempfile.mkstemp(suffix=".fasta")
+        os.close(tmp_fd)
+        fasta_sink = tmp_fasta
+
+    base_argv = [famsa, "-keep-duplicates", "-t", str(threads), "-gt", gt]
+    if medoidtree_flag:
+        base_argv.append("-medoidtree")
+
+    align_argv = list(base_argv) + list(extra_args) + [in_fasta, fasta_sink]
+
+    t0 = time.perf_counter()
+    try:
+        _run_cmd(align_argv)
+        if output_format != "fasta":
+            AlignIO.convert(fasta_sink, "fasta", out_path, output_format)
+        # FAMSA's `-gt_export` is a no-argument flag that repurposes the
+        # positional output file as the Newick guide tree (it does *not*
+        # take a filename). To get both an alignment and a tree we run
+        # FAMSA a second time with the same tree-affecting flags, writing
+        # the tree to <outdir>/guidetree.dnd (parity with Clustal Omega).
+        if guidetree_out_flag:
+            guidetree_path = os.path.join(out_dir, "guidetree.dnd")
+            gt_argv = list(base_argv) + ["-gt_export", in_fasta, guidetree_path]
+            _run_cmd(gt_argv)
+    finally:
+        if tmp_fasta is not None and os.path.isfile(tmp_fasta):
+            os.unlink(tmp_fasta)
+    elapsed = time.perf_counter() - t0
+
+    n_out = _count_aligned(out_path, output_format)
+    logger.info(
+        "Alignment done: %d sequences written to %s in %.2fs",
+        n_out, out_path, elapsed,
+    )
+    return {"n_in": n_in, "n_out": n_out, "elapsed_s": elapsed}
+
+
 ALIGNERS = {
     "mafft": _align_mafft,
     "clustalo": _align_clustalo,
+    "famsa": _align_famsa,
 }
 
 ALIGNER_BINARIES = {
     "mafft": "mafft",
     "clustalo": "clustalo",
+    "famsa": "famsa",
 }
 
 

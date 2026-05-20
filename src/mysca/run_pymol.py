@@ -13,11 +13,15 @@ signature::
 
     def feature_fn(struct, cmd, *, color=None, context=None) -> None
 
-``struct`` is the PyMOL object name; ``cmd`` is PyMOL's ``cmd`` module
-(injected so users don't need ``from pymol import cmd``); ``context``
-carries a dict with keys ``projection``, ``scaffold``, ``group_idx``,
-``outdir`` so feature functions can read ``chain_id`` /
-``ic_pdb_residues`` / ``pdb_path`` off the projection.
+``struct`` is the PyMOL object name of the loaded scaffold and is
+always the literal string ``"struct"`` (see ``SCAFFOLD_OBJECT_NAME``);
+the structure_id (e.g. ``"1Q16"``) is in ``context["scaffold"]``.
+``cmd`` is PyMOL's ``cmd`` module (injected so users don't need
+``from pymol import cmd``); ``context`` carries a dict with keys
+``projection``, ``scaffold``, ``group_idx``, ``outdir``, and
+``select`` (a noisy ``cmd.select`` wrapper that logs a WARNING on
+zero-match selections — preferred over calling ``cmd.select``
+directly).
 
 -------------------------------------------------------------------------------
 COMMAND LINE ARGUMENTS:
@@ -37,6 +41,8 @@ COMMAND LINE ARGUMENTS:
         feature functions.
     --features NAME[,NAME,...] : names in --features_py to invoke per
         render pass. Requires --features_py.
+    --struct_style {sticks,cartoon,ribbon,lines,surface} : PyMOL
+        representation for the scaffold structure. Default 'sticks'.
     --views : save four rotated side views per frame.
     --animate : save a rotating GIF per rendered frame (one per IC
         group in the default mode; one covering all groups under
@@ -54,12 +60,19 @@ COMMAND LINE ARGUMENTS:
         'mp4' / 'both' require the optional ``imageio-ffmpeg``
         dependency.
     --mode {spin,reveal} : animation mode. 'spin' (default) rotates;
-        'reveal' is a still-camera narrative animation.
+        'reveal' is a still-camera narrative animation. See the
+        "Reveal mode" section of `docs/cli_reference.md#sca-pymol`
+        for stage scheduling details and examples.
     --reveal_schedule {cumulative,sequential,custom} : how groups
         appear across stages in --mode reveal. Default cumulative.
     --reveal_custom STAGE [STAGE ...] : custom stage schedule when
         --reveal_schedule custom. Each STAGE is a comma-separated
         list of IC group indices visible in that stage.
+    --sector_colors SPEC : sector palette. Accepts 'default' (built-in
+        20-color palette), a comma-separated list of hex / named
+        colors, a path to a .json or one-color-per-line text file, or
+        the name of a registered matplotlib colormap (e.g. 'tab10',
+        'Set1'). Default: 'default'.
 
 -------------------------------------------------------------------------------
 EXAMPLE USAGE:
@@ -88,7 +101,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 
-from mysca.constants import SECTOR_COLORS
+from mysca.constants import resolve_sector_colors
 from mysca.logging_config import configure_logging
 
 # pymol, imageio, and PIL are deferred imports (see _require_cmd /
@@ -98,14 +111,29 @@ from mysca.logging_config import configure_logging
 PYMOL_LOG_FNAME = "pymol.log"
 STRUCTURE_JSON_FNAME = "structure_projection.json"
 
+# PyMOL object names. Hoisted from previously-scattered string literals
+# so the features-plugin contract ("struct" is always literally the
+# loaded object name") is enforced at one place.
+SCAFFOLD_OBJECT_NAME = "struct"
+REF_SCAFFOLD_OBJECT_NAME = "ref_struct"
+
 logger = logging.getLogger("mysca.run_pymol")
 
 DEFAULT_STRUCT_COLOR = "gray70"
 DEFAULT_STRUCT_STYLE = "sticks"
 DEFAULT_STRUCT_ALPHA = 0.5
-DEFAULT_SECTOR_COLORS = SECTOR_COLORS
 DEFAULT_SECTOR_STYLE = "spheres"
 DEFAULT_BG_COLOR = "white"
+
+STRUCT_STYLE_CHOICES = ("sticks", "cartoon", "ribbon", "lines", "surface")
+# PyMOL transparency settings keyed by representation name.
+STRUCT_TRANSPARENCY_PROP = {
+    "sticks": "stick_transparency",
+    "cartoon": "cartoon_transparency",
+    "ribbon": "ribbon_transparency",
+    "lines": "line_transparency",
+    "surface": "transparency",
+}
 
 
 def parse_args(args):
@@ -154,6 +182,13 @@ def parse_args(args):
         "--features", type=str, default=None, metavar="NAMES",
         help="Comma-separated names in --features_py to invoke per "
         "render pass. Requires --features_py.",
+    )
+    parser.add_argument(
+        "--struct_style", type=str, default=DEFAULT_STRUCT_STYLE,
+        choices=list(STRUCT_STYLE_CHOICES),
+        help="PyMOL representation for the scaffold structure. Default "
+        f"{DEFAULT_STRUCT_STYLE!r}. Use 'cartoon' to see secondary "
+        "structure; 'sticks' shows every atom.",
     )
     parser.add_argument(
         "--views", action="store_true",
@@ -230,11 +265,25 @@ def parse_args(args):
         "Example: --reveal_custom \"1\" \"1,2\" \"1,3\" \"2,3\".",
     )
     parser.add_argument(
+        "--sector_colors", type=str, default="default", metavar="SPEC",
+        help="Sector palette. SPEC accepts: 'default' (built-in "
+        "20-color palette), a comma-separated list of hex / named "
+        "colors, a path to a .json or text file, or the name of a "
+        "registered matplotlib colormap (e.g. 'tab10', 'Set1'). "
+        "'none' is rejected here — sca-pymol always needs colors. "
+        "Default: 'default'.",
+    )
+    parser.add_argument(
         "-v", "--verbosity", type=int, default=1,
         help="Verbosity level (0=warnings only).",
     )
 
     parsed = parser.parse_args(args)
+    if parsed.sector_colors == "none":
+        parser.error(
+            "--sector_colors=none is not supported by sca-pymol; "
+            "sectors must have a palette to render."
+        )
     if parsed.features and not parsed.features_py:
         parser.error("--features requires --features_py.")
     if parsed.reveal_custom and parsed.reveal_schedule != "custom":
@@ -301,14 +350,22 @@ def _load_projections(structure_dir: str) -> list[dict]:
 
 def _require_cmd():
     """Import pymol lazily so argparse / features-loader tests can run
-    in environments without pymol-open-source installed."""
+    in environments without pymol-open-source installed.
+
+    `pymol-open-source` is a required runtime dependency declared in
+    ``environment.yml``, but it is not pip-installable on every platform
+    so we still raise a clear ImportError with an install hint rather
+    than letting an opaque module-not-found error escape.
+    """
     try:
         from pymol import cmd  # noqa: F401
     except ImportError as exc:  # pragma: no cover
         raise ImportError(
-            "sca-pymol requires the optional pymol-open-source "
-            "dependency. Install via `conda install -c conda-forge "
-            "pymol-open-source` or equivalent."
+            "sca-pymol requires pymol-open-source, which was not found "
+            "in the active Python environment. It is not pip-installable "
+            "on every platform; install via "
+            "`conda install -c conda-forge pymol-open-source` (already "
+            "pinned in environment.yml)."
         ) from exc
     return cmd
 
@@ -372,7 +429,8 @@ def main(args):
             len(feature_fns), args.features_py,
         )
 
-    sector_colors = [_hex2color(x) for x in DEFAULT_SECTOR_COLORS]
+    palette = resolve_sector_colors(args.sector_colors)
+    sector_colors = [_hex2color(x) for x in palette]
     cmd = _require_cmd()
 
     custom_reveal = (
@@ -423,6 +481,7 @@ def main(args):
             format=args.format,
             mode=args.mode,
             reveal_schedule=reveal_schedule,
+            struct_style=args.struct_style,
         )
 
     logger.info("Done!")
@@ -449,9 +508,9 @@ def _render_one_structure(
         format: str = "gif",
         mode: str = "spin",
         reveal_schedule: list[list[int]] | None = None,
+        struct_style: str = DEFAULT_STRUCT_STYLE,
 ):
     struct_color = DEFAULT_STRUCT_COLOR
-    struct_style = DEFAULT_STRUCT_STYLE
     struct_alpha = DEFAULT_STRUCT_ALPHA
     sector_style = DEFAULT_SECTOR_STYLE
 
@@ -472,14 +531,14 @@ def _render_one_structure(
     # Fresh PyMOL session per structure so selections / objects don't
     # leak between structures in seq_map batches.
     cmd.delete("all")
-    cmd.load(pdb_path, "struct")
+    cmd.load(pdb_path, SCAFFOLD_OBJECT_NAME)
 
     ref_scaffold = None
     if reference_projection is not None:
         ref_scaffold = reference_projection["structure_id"]
         ref_pdb = reference_projection.get("pdb_path")
         if ref_pdb and os.path.isfile(ref_pdb):
-            cmd.load(ref_pdb, "ref_struct")
+            cmd.load(ref_pdb, REF_SCAFFOLD_OBJECT_NAME)
         else:
             logger.warning(
                 "Reference %s has no valid pdb_path; skipping alignment.",
@@ -487,16 +546,16 @@ def _render_one_structure(
             )
             ref_scaffold = None
 
-    cmd.hide("everything", "struct")
+    cmd.hide("everything", SCAFFOLD_OBJECT_NAME)
     if ref_scaffold:
-        cmd.hide("everything", "ref_struct")
+        cmd.hide("everything", REF_SCAFFOLD_OBJECT_NAME)
     cmd.bg_color(DEFAULT_BG_COLOR)
-    cmd.show(struct_style, "struct")
-    cmd.color(struct_color, "struct")
+    cmd.show(struct_style, SCAFFOLD_OBJECT_NAME)
+    cmd.color(struct_color, SCAFFOLD_OBJECT_NAME)
     cmd.set(
-        {"sticks": "stick_transparency"}.get(struct_style, DEFAULT_STRUCT_STYLE),
+        STRUCT_TRANSPARENCY_PROP[struct_style],
         1 - struct_alpha,
-        "struct",
+        SCAFFOLD_OBJECT_NAME,
     )
     cmd.zoom(complete=1)
 
@@ -569,6 +628,28 @@ def _selection_from_residues(residues):
     return "resi " + "+".join(str(r) for r in residues)
 
 
+def _make_safe_select(cmd, scaffold):
+    """Return a wrapper around ``cmd.select`` that logs a WARNING when a
+    selection matches zero atoms.
+
+    Plumbed into the features context as ``context["select"]`` so user
+    feature functions can opt into noisy failure for the most common
+    brittle pattern (PDB form mismatch — segi-path selectors that match
+    the biological-assembly form but not the asymmetric-unit form, or
+    vice versa).
+    """
+    def select(name, selection, *args, **kwargs):
+        n = cmd.select(name, selection, *args, **kwargs)
+        if n == 0:
+            logger.warning(
+                "Feature selection %r matched 0 atoms on %s "
+                "(selection=%r). PDB form mismatch?",
+                name, scaffold, selection,
+            )
+        return n
+    return select
+
+
 def _run_feature_fns(cmd, feature_fns, scaffold, projection, group_idx, outdir):
     if not feature_fns:
         return
@@ -577,9 +658,10 @@ def _run_feature_fns(cmd, feature_fns, scaffold, projection, group_idx, outdir):
         "scaffold": scaffold,
         "group_idx": group_idx,
         "outdir": outdir,
+        "select": _make_safe_select(cmd, scaffold),
     }
     for fn in feature_fns:
-        fn(scaffold, cmd, color=None, context=context)
+        fn(SCAFFOLD_OBJECT_NAME, cmd, color=None, context=context)
 
 
 def _apply_group_coloring(
@@ -626,7 +708,7 @@ def _apply_group_coloring(
 
 def _align_and_focus(cmd, ref_scaffold):
     if ref_scaffold:
-        cmd.align("struct", "ref_struct")
+        cmd.align(SCAFFOLD_OBJECT_NAME, REF_SCAFFOLD_OBJECT_NAME)
     cmd.center()
     cmd.zoom(complete=1)
 
@@ -638,9 +720,9 @@ def _write_views(cmd, outdir, basename, ref_scaffold, *, dpi: int = 300):
     os.makedirs(viewsdir, exist_ok=True)
     for ri in range(4):
         cmd.png(os.path.join(viewsdir, f"{basename}_view{ri}.png"), dpi=dpi)
-        cmd.rotate("y", 90, "struct")
+        cmd.rotate("y", 90, SCAFFOLD_OBJECT_NAME)
         if ref_scaffold:
-            cmd.rotate("y", 90, "ref_struct")
+            cmd.rotate("y", 90, REF_SCAFFOLD_OBJECT_NAME)
 
 
 def _ray_sequence(mode: str, nframes: int) -> list[int]:

@@ -42,7 +42,7 @@ The aligned output is written to `<output-dir>/aligned.fasta`.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--align` | `mafft` | Alignment method. Choices: `mafft`, `clustalo` |
+| `--align` | `mafft` | Alignment method. Choices: `mafft`, `clustalo`, `famsa` |
 | `--align_threads` | 1 | Threads for the alignment tool |
 | `--align_bin` | (from PATH) | Explicit path to the alignment binary |
 | `--align_extra` | [] | Raw passthrough args appended to the aligner CLI verbatim |
@@ -57,9 +57,19 @@ Each aligner's wrapper consumes a known set of keys; unknown keys raise. Bare `K
   - `guidetree_out=true` — write the guide tree to `<outdir>/guidetree.dnd`
   - `output_order=tree-order` or `output_order=input-order`
   - `seqtype=protein` (default) — overridable for nucleic acid input
+- **`famsa`**:
+  - `guidetree_out=true` — write the Newick guide tree to `<outdir>/guidetree.dnd`
+  - `gt=sl` (default), `gt=upgma`, or `gt=nj` — guide-tree method
+  - `medoidtree=true` — use FAMSA's MedoidTree heuristic (speeds up large MSAs)
+
+  FAMSA's `-keep-duplicates` is always passed by the wrapper so the input
+  record set is preserved (parity with `mafft`/`clustalo`).
 - **`mafft`**: no keys currently. Pass any raw CLI flags via `--align_extra` instead.
 
-Example: `--align clustalo --align_args guidetree_out=true output_order=tree-order`.
+Examples:
+
+- `--align clustalo --align_args guidetree_out=true output_order=tree-order`
+- `--align famsa --align_args gt=upgma medoidtree=true`
 
 ### Optional Arguments
 
@@ -74,7 +84,7 @@ Example: `--align clustalo --align_args guidetree_out=true output_order=tree-ord
 Writes to the specified output directory:
 - `aligned.fasta` or `aligned.sto` — aligned MSA (depending on `--output_format`)
 - `clustered.fasta` — clustered FASTA (only when `--cluster mmseqs2`)
-- `guidetree.dnd` — guide tree (only with `--align clustalo --align_args guidetree_out=true`)
+- `guidetree.dnd` — guide tree (only with `--align clustalo` or `--align famsa`, with `--align_args guidetree_out=true`)
 - `filter_history.json` — per-stage sequence counts (initial / cluster / align); always persisted so `sca-plots` can replay the diagnostic plot later
 - `prealign_args.json` — arguments used
 - `prealign.log` — run log
@@ -82,7 +92,7 @@ Writes to the specified output directory:
 
 ### External Binaries
 
-The aligner binary (`mafft` or `clustalo`, depending on `--align`) and `mmseqs` (when `--cluster mmseqs2`) must be resolvable on `PATH` — the CLI checks up front and raises `FileNotFoundError` immediately if a required tool is missing. Install e.g. via `conda install -c bioconda mafft mmseqs2 clustalo`, or pass explicit paths with `--align_bin` / `--cluster_bin`.
+The aligner binary (`mafft`, `clustalo`, or `famsa`, depending on `--align`) and `mmseqs` (when `--cluster mmseqs2`) must be resolvable on `PATH` — the CLI checks up front and raises `FileNotFoundError` immediately if a required tool is missing. Install e.g. via `conda install -c conda-forge -c bioconda mafft mmseqs2 clustalo famsa`, or pass explicit paths with `--align_bin` / `--cluster_bin`.
 
 ---
 
@@ -120,26 +130,27 @@ sca-preprocess -i <input-msa> -o <output-dir> [options]
 |----------|---------|-------------|
 | `-v, --verbosity` | 1 | Verbosity level |
 | `--pbar` | off | Enable progress bar |
-| `--plot` | off | Emit `filter_history.png` and `filter_distributions.png` to `outdir/images/` |
+| `--plot` / `--no-plot` | on | Emit `filter_history.png` and `filter_distributions.png` to `outdir/images/`. Default: on. Pass `--no-plot` to skip plot generation entirely (no `images/` directory is created) |
 | `--input_format` | `fasta` | Format of the input MSA file. Choices: `fasta`, `stockholm`. Never inferred from the filename |
 | `--syms` | `default` | Symbol alphabet. `default` → standard 20 amino acids; `none` → disable excluded-symbol filtering and auto-detect; any other string is treated as an explicit character set |
 | `--gapsym` | `-` | Gap symbol in the input MSA |
 | `--gap_value` | 0 | Integer assigned to the gap symbol in the `SymMap`. Default 0 (gap first). Pass `len(aa_syms)` (e.g. 20) to place the gap at the end (legacy behavior) |
-| `--weight_method` | `sparse` | Sequence-weight computation backend. `sparse` uses a CPU sparse-CSR implementation; `gpu` dispatches to torch (CUDA/MPS/XPU), falling back to `sparse` if no accelerator is detected. See [weight methods](weight_methods.md) for full details |
+| `--accelerator` | `none` | Global accelerator preference. Choices: `none`, `gpu`. When `gpu`, `--weight_method` auto-defaults to `gpu` (torch CUDA/MPS/XPU; falls back to `sparse` if no accelerator is detected). An explicit `--weight_method` overrides this preference |
+| `--weight_method` | (resolved via `--accelerator`) | Sequence-weight computation backend. Choices: `sparse` (CPU sparse-CSR), `gpu` (torch CUDA/MPS/XPU). When unset, defaults to `sparse` (or `gpu` when `--accelerator gpu`). See [weight methods](weight_methods.md) for full details |
 | `--block_size` | 512 | Block size for relevant weight computations |
 
 ### Output
 
 Writes to the specified output directory:
 
-- `preprocessing_results.npz` — filtered MSA, retained indices, sequence weights, pre-truncation gap frequencies
+- `preprocessing_results.npz` — filtered MSA, retained indices, sequence weights, pre-truncation gap frequencies, and `seq_retained_fraction` (1D float array of length `M_input` — for every input MSA sequence, the fraction of its non-gap residues that survived column filtering; indexed by post-`load_msa` input order, NOT the retained subset; NaN where an input row has zero non-gap residues)
 - `preprocessing_args.json` — arguments used
 - `sym2int.json` — symbol-to-integer mapping
 - `msa_binary2d_sp.npz` — sparse one-hot MSA
 - `msa_orig.fasta-aln` — original MSA (written before any filtering)
-- `filter_history.json` — per-stage filter diagnostics (counts + threshold + stat distribution); always persisted so `sca-plots` can replay plots later
+- `filter_history.json` — per-stage filter diagnostics (counts + threshold + stat distribution); always persisted so `sca-plots` can replay plots later. When `load_msa` performed pre-preprocessing drops, an `internal_stop_codon` stage and/or an `excluded_symbols` stage appears at the head of the list. Trailing `*` stop codons are silently replaced with gap inside `load_msa` and do not produce their own stage
 - `preprocessing.log` — run log
-- `images/` — only when `--plot` is passed (`filter_history.png`, `filter_distributions.png`)
+- `images/` — written by default (`filter_history.png`, `filter_distributions.png`); pass `--no-plot` to skip
 
 ---
 
@@ -174,6 +185,7 @@ sca-core -i <preprocessing-dir> -o <output-dir> [options]
 | `--weak_assignment` | [] | IC indices to exclude from the `exclusive`-assignment tie-break (variadic integers). Ignored under `overlap` |
 | `--n_logged_comps` | 10 | Number of top ICs to summarize in the log after assignment (significance marker, eigenvalue, and MSA positions in processed / unprocessed / reference coordinates). `0` disables the summary |
 | `--sectors_for` | None | Target sequences to expand into the per-seq output files (`ic_residues_per_seq.npz` + `ic_loadings_per_seq.npz`). `None`: reference only. `all`: every retained sequence. Otherwise: path to a text file with one sequence ID per line |
+| `--coverage_for` | `all` | Input-MSA sequences to compute per-component coverage fractions for (`component_coverage_per_seq.npz`). For each selected sequence, stores a length-`n_components` float vector: the fraction of each IC's high-load positions where the sequence has a non-gap residue. `all` (default): every input MSA sequence, including those filtered during preprocessing. `reference`: reference sequence only. Otherwise: path to a text file with one sequence ID per line |
 
 ### Optional Arguments
 
@@ -181,10 +193,18 @@ sca-core -i <preprocessing-dir> -o <output-dir> [options]
 |----------|---------|-------------|
 | `--seed` | None | Random seed for reproducibility. `None` or non-positive auto-generates one |
 | `--save_all` | off | Save large intermediate matrices (`Cijab_raw`, `fijab`) into `scarun_results.npz` |
-| `--use_jax` | off | Use JAX in the core SCA computations |
+| `--save_dataframe` | off | Also write `seq_projections.tsv` (columns: `seq_id`, `aligned_sequence`, `Up_0..Up_{n_components-1}`) for every retained sequence. Requires pandas |
+| `--seq_metadata` | None | Optional TSV path with a `seq_id` column plus any user-supplied columns. Persisted as `sequence_metadata.tsv` and merged into `seq_projections.tsv` via left-join on `seq_id` when `--save_dataframe` is set |
+| `--seq_proj_color_by` | None | Optional column name in `--seq_metadata` to color the `seq_proj_ic*.png` plot by. Numeric columns get a colorbar; categorical columns get a legend |
+| `--accelerator` | `none` | Global accelerator preference. Choices: `none`, `gpu`. When `gpu`, `--freq_method` auto-defaults to `gpu` (torch tensordot with graceful CPU fallback). An explicit `--freq_method` overrides this preference |
+| `--freq_method` | (resolved via `--accelerator`) | Backend for the `compute_fijab` kernel. Choices: `numpy` (CPU `np.tensordot`; ~9x faster than the legacy v1 double-loop on SH3-scale input), `jax` (whole-tensordot under `jax.jit`), `gpu` (torch tensordot, falls back to `numpy` on no-GPU). When unset, defaults to `numpy` (or `gpu` when `--accelerator gpu`) |
+| `--use_jax` | off | **DEPRECATED**: alias for `--freq_method=jax`. Emits a `DeprecationWarning` when used; will be removed in a future release |
+| `--precision` | `fp64` | GPU compute precision for the `fijab` and eigvalsh-bootstrap kernels. Choices: `fp64` (matches CPU bit-for-bit), `fp32` (~2× faster on most GPUs, ~7-decimal precision), `fp16` (highest throughput on tensor cores; the eigendecomposition auto-promotes to `fp32` since `eigvalsh` is unstable in fp16 — treat fp16 as a preview). Ignored on CPU kernels |
+| `--bootstrap_chunk` | 1 | Number of bootstrap iterations to batch per GPU dispatch when `--freq_method=gpu`. Default 1 (per-iter dispatch — equivalent to today's behavior). Larger chunks amortize per-iter setup but multiply peak GPU memory by the chunk size; auto-reduced on OOM. Ignored on non-GPU paths |
 | `--nodendro` | off | Skip dendrogram and sequence-similarity plots |
+| `--plot / --no-plot` | on | Write diagnostic plots to `outdir/images/`. Default: on. Pass `--no-plot` to skip plot generation entirely (no `images/` directory is created) |
 | `--load_data` | "" | Path to a previous SCA output directory to load precomputed data (skips recomputation) |
-| `--sector_cmap` | `default` | Sector colormap for the SCA-matrix sector-subset plot. Choices: `none`, `default` |
+| `--sector_colors` | `default` | Sector palette for the SCA-matrix sector-subset plot. Accepts: `default` (built-in 20-color palette), `none` (skip per-sector coloring), a comma-separated list of hex / named colors (e.g. `"#e377c2,#f62727,red"`), a path to a `.json` array or one-color-per-line text file, or the name of a registered matplotlib colormap (e.g. `tab10`, `Set1`) |
 | `-v, --verbosity` | 1 | Verbosity level |
 | `--pbar` | off | Enable progress bar |
 
@@ -197,10 +217,13 @@ Writes to the specified output directory:
 - `scarun_args.json` — arguments used
 - `ic_residues_per_seq.npz` — per-target IC residues in **raw-sequence coordinates**, keyed `ic_{i}_{seqid}` → 1D int array of residue indices
 - `ic_loadings_per_seq.npz` — per-residue IC loadings parallel to `ic_residues_per_seq`, same `ic_{i}_{seqid}` key format. Only the top-`kstar` ICs are expanded per sequence; which target sequences appear is controlled by `--sectors_for`
+- `component_coverage_per_seq.npz` — per-input-sequence per-IC coverage fractions, keyed by `seq_id` → length-`n_components` float vector. The `i`-th entry is the fraction of IC `i`'s high-load positions where the sequence has a non-gap residue. Which sequences appear is controlled by `--coverage_for` (default: every input MSA sequence, including ones filtered during preprocessing). NaN flags an IC whose high-load position set is empty
 - `sca_results/` — `v_ica_normalized.npy`, `w_ica.npy`, `t_dists_info.json`, `evals_shuff.npy`, `sca_matrix_sector_subset.npy`, scalar text files (`kstar.txt`, `n_components.txt`, etc.)
 - `ic_positions/` — per-IC bundle: `ic_{i}_msaproc.npy` (high-load positions in processed-MSA coordinates), `ic_{i}_msaorig.npy` (the same positions in original-MSA coordinates), `ic_{i}_loadings.npy` (IC loadings at those positions)
 - `scarun.log` — run log
-- `images/` — plots (conservation, SCA matrix, spectrum vs null, dendrogram, t-distributions, EV/IC scatter sweeps)
+- `seq_projections.tsv` — only when `--save_dataframe`; tab-separated table with `seq_id`, `aligned_sequence`, and `Up_0..Up_{n_components-1}` columns. When `--seq_metadata` is also given, the metadata file's non-`seq_id` columns are merged in via left-join on `seq_id`
+- `sequence_metadata.tsv` — only when `--seq_metadata` is supplied; verbatim copy of the user-supplied TSV (loadable via `SCAResults.load`)
+- `images/` — plots (conservation, SCA matrix, spectrum vs null, dendrogram, t-distributions, EV/IC scatter sweeps, sector-subset, and `seq_proj_ic0v1.png` projecting all sequences onto the first two ICs). Only written when `--plot` is set (the default); `--no-plot` skips the directory entirely.
 
 ---
 
@@ -208,7 +231,7 @@ Writes to the specified output directory:
 
 Render SCA sectors on 3D protein structures using PyMOL. Consumes `sca-structure` output directly — the per-structure `ic_pdb_residues` list carries authoritative PDB residue numbers (via `PDBStructure.residue_ids`), and `pdb_path` tells `sca-pymol` which file to load. Protein-specific annotations (cofactors, iron-sulfur clusters, ligands, etc.) are supplied by a user Python file via `--features_py`.
 
-Requires the optional `pymol-open-source` dependency (`conda install -c conda-forge pymol-open-source`).
+Requires `pymol-open-source` (pinned in `environment.yml`; for pip-only installs, run `conda install -c conda-forge pymol-open-source`).
 
 ### Usage
 
@@ -219,6 +242,7 @@ sca-pymol --structure <structure-out-dir> \
     [--multisector] \
     [-r REF_STRUCTURE_ID] \
     [--features_py PATH] [--features NAME[,NAME...]] \
+    [--struct_style {sticks,cartoon,ribbon,lines,surface}] \
     [--views] [--animate] [--nframes N] [--duration SEC] \
     [--spin_axis {x,y,z}] [--spin_degrees N] \
     [--ray {none,first,all}] [--dpi N] \
@@ -226,6 +250,7 @@ sca-pymol --structure <structure-out-dir> \
     [--mode {spin,reveal}] \
     [--reveal_schedule {cumulative,sequential,custom}] \
     [--reveal_custom STAGE [STAGE ...]] \
+    [--sector_colors SPEC] \
     -o <outdir> [-v N]
 ```
 
@@ -246,6 +271,7 @@ sca-pymol --structure <structure-out-dir> \
 | `--multisector` | off | Render all selected groups on a single frame per structure instead of one frame per group |
 | `--features_py` | None | Path to a user Python file supplying protein-specific annotation functions |
 | `--features` | None | Comma-separated names of callables in `--features_py` to invoke per render pass. Requires `--features_py` |
+| `--struct_style` | `sticks` | PyMOL representation for the scaffold structure (choices: `sticks`, `cartoon`, `ribbon`, `lines`, `surface`). `cartoon` shows secondary structure; `sticks` shows every atom |
 | `--views` | off | Save four rotated side views per frame under `outdir/views/` |
 | `--animate` | off | Save a rotating GIF per rendered frame under `outdir/` — one per IC group in the default mode; one covering all selected groups under `--multisector` |
 | `--nframes` | 24 | Animation frame count (only used with `--animate`) |
@@ -258,6 +284,7 @@ sca-pymol --structure <structure-out-dir> \
 | `--mode` | `spin` | Animation mode: `spin` (default — rotating camera, all selected groups lit) or `reveal` (still camera, narrative walk through stages of which groups are visible — see below) |
 | `--reveal_schedule` | `cumulative` | Stage schedule for `--mode reveal`: `cumulative` (groups stack one at a time), `sequential` (one group at a time, swapped out as the next appears), or `custom` (use `--reveal_custom`) |
 | `--reveal_custom` | None | Custom reveal stages (used with `--reveal_schedule custom`). Each STAGE is a comma-separated list of IC group indices visible in that stage; stages are space-separated. Example: `--reveal_custom "1" "1,2" "1,3" "2,3"` |
+| `--sector_colors` | `default` | Sector palette. Accepts `default` (built-in 20-color palette), a comma-separated list of hex / named colors, a path to a `.json` array or one-color-per-line text file, or the name of a registered matplotlib colormap (e.g. `tab10`, `Set1`). `none` is rejected — sca-pymol always needs colors |
 | `-v, --verbosity` | 1 | Verbosity level |
 
 ### Output
@@ -281,16 +308,22 @@ def feature_fn(struct, cmd, *, color=None, context=None) -> None:
     ...
 ```
 
-- `struct` — PyMOL object name (always `"struct"` in the current implementation).
+- `struct` — PyMOL object name of the loaded scaffold. Always the literal string `"struct"` (matches `mysca.run_pymol.SCAFFOLD_OBJECT_NAME`); the structure_id (e.g. `"1Q16"`) is in `context["scaffold"]`.
 - `cmd` — PyMOL's `cmd` module, injected so the file does not need `from pymol import cmd`.
 - `color` — optional per-feature color (currently always `None`; plumbed for a future flag).
-- `context` — dict with `projection`, `scaffold`, `group_idx`, `outdir`. Read `projection["chain_id"]`, `projection["ic_pdb_residues"]`, `projection["pdb_path"]`, etc. as needed.
+- `context` — dict with `projection`, `scaffold`, `group_idx`, `outdir`, and `select`. Read `projection["chain_id"]`, `projection["ic_pdb_residues"]`, `projection["pdb_path"]`, etc. as needed.
+
+Prefer `context["select"]` over `cmd.select` directly — it logs a WARNING when a selection matches zero atoms, which catches the most common silent failure (PDB form mismatch). Example:
+
+```python
+context["select"]("mo", "resn 6MO and resi 1302 and name MO")
+```
 
 Ship-ready example: [`demo/pymol_features/narg_1q16.py`](../demo/pymol_features/narg_1q16.py) ports the previously-hardcoded molybdenum / [4Fe-4S] / MGD cofactor selections for 1Q16 NarG:
 
 ```python
 def show_molybdenum(struct, cmd, *, color=None, context=None):
-    cmd.select("mo", f"{struct}/F/A/6MO`1302/MO")
+    context["select"]("mo", "resn 6MO and resi 1302 and name MO")
     cmd.show("everything", "mo")
     if isinstance(color, str):
         cmd.color(color, "mo")
@@ -306,6 +339,24 @@ sca-pymol --structure out/structure --structure_id NarG_1Q16 \
 ```
 
 Loader errors surface at CLI startup (before any rendering): missing file → `FileNotFoundError`, missing attribute → `ValueError`, non-callable attribute → `TypeError`.
+
+#### Authoring guidance: prefer attribute selectors
+
+The same PDB ID can be served in multiple legitimate "forms" with different chain / segi layouts:
+
+- **RCSB asymmetric-unit** (`https://files.rcsb.org/download/<id>.pdb`) — what most users get by default. Often packs all hetero atoms onto chain A.
+- **RCSB biological-assembly** (`<id>.pdb1`, `<id>.pdb2`, ...) — splits cofactors across chains / segis to reflect the functional oligomer.
+- **PDBe-updated mmCIF** — adds remediation that can rename chains relative to either RCSB form.
+
+Selectors like `` f"{struct}/F/A/6MO`1302/MO" `` (chain/segi-path) only match one specific form and silently match zero atoms on the others. Attribute-based selectors (`resn`, `resi`, `name`) read directly off the residue dictionary and stay portable across forms:
+
+| Brittle (segi-path)                                         | Portable (attribute-based)                   |
+|-------------------------------------------------------------|----------------------------------------------|
+| `` f"{struct}/F/A/6MO`1302/MO" ``                           | `resn 6MO and resi 1302 and name MO`         |
+| `` f"{struct}/G/A/SF4`1401/*" ``                            | `resn SF4 and resi 1401`                     |
+| `` f"{struct}/D/A/MD1`1300/* {struct}/E/A/MD1`1301/*" ``    | `resn MD1 and resi 1300+1301`                |
+
+When you must use a chain/segi-path selector (e.g. the same residue number appears on multiple chains and you need to disambiguate), pair it with `context["select"]` so a form mismatch surfaces as a WARNING instead of a silently empty render.
 
 ### Animation
 
@@ -379,7 +430,8 @@ Regenerate diagnostic plots from persisted results, without rerunning the pipeli
 ### Usage
 
 ```bash
-sca-plots [--prealign DIR] [--preprocessing DIR] [--scacore DIR] [--imgdir DIR] [-v N]
+sca-plots [--prealign DIR] [--preprocessing DIR] [--scacore DIR] [--imgdir DIR] \
+    [--seq_proj_color_by COLUMN] [--sector_colors SPEC] [-v N]
 ```
 
 ### Arguments
@@ -388,8 +440,10 @@ sca-plots [--prealign DIR] [--preprocessing DIR] [--scacore DIR] [--imgdir DIR] 
 |----------|---------|-------------|
 | `--prealign` | None | Prealign output directory (contains `filter_history.json`). Regenerates `plot_prealign_filter_history` |
 | `--preprocessing` | None | Preprocessing output directory (contains `preprocessing_results.npz`, `filter_history.json`, `msa_binary2d_sp.npz`). Regenerates `plot_filter_history`, `plot_filter_distributions`, `plot_sequence_similarity`. When passed alongside `--scacore`, also enables the positional conservation plots (they need `retained_positions` + the original MSA length) |
-| `--scacore` | None | SCA core output directory. Regenerates `plot_conservation`, `plot_sca_matrix`, `plot_sca_spectrum`, `plot_sca_spectrum_vs_null`, `plot_dendrogram`, `plot_t_distributions`, `plot_data_2d`/`3d` (EV + IC sweeps), `plot_sca_matrix_sector_subset`. With `--preprocessing` also given, adds `plot_conservation_top` and `plot_conservation_positional` |
+| `--scacore` | None | SCA core output directory. Regenerates `plot_conservation`, `plot_sca_matrix`, `plot_sca_spectrum`, `plot_sca_spectrum_vs_null`, `plot_dendrogram`, `plot_t_distributions`, `plot_data_2d`/`3d` (EV + IC sweeps), `plot_sca_matrix_sector_subset`. With `--preprocessing` also given, adds `plot_conservation_top`, `plot_conservation_positional`, and `plot_seq_projection_2d` (the latter needs `msa_binary3d`) |
 | `--imgdir` | None | Output directory for all plots. When omitted, plots go into each stage's own `images/` subdirectory |
+| `--seq_proj_color_by` | None | Color the `seq_proj_ic*.png` plot by this column of `sequence_metadata.tsv` (loaded from `--scacore`). Numeric columns get a colorbar; categorical columns get a legend |
+| `--sector_colors` | `default` | Sector palette for the SCA-matrix sector-subset plot. Accepts: `default` (built-in 20-color palette), `none` (skip per-sector coloring), a comma-separated list of hex / named colors, a path to a `.json` array or one-color-per-line text file, or the name of a registered matplotlib colormap (e.g. `tab10`, `Set1`) |
 | `-v, --verbosity` | 1 | Verbosity level |
 
 ### Notes
@@ -405,7 +459,23 @@ Project primary amino-acid sequences (in- or out-of-sample) onto an existing SCA
 ### Usage
 
 ```bash
+# Standard form: project every record in a FASTA.
 sca-project -i <sequences.fasta> \
+    --preprocessing <preprocess-dir> \
+    --scacore <scacore-dir> \
+    -o <output-dir> [options]
+
+# In-sample replay: extract one record from the training MSA by ID,
+# ungap it, and project. Equivalent to writing a one-record FASTA by
+# hand and feeding it via -i.
+sca-project --from_msa <preprocess-dir>/msa_orig.fasta-aln \
+    --seq_id <ID> \
+    --preprocessing <preprocess-dir> \
+    --scacore <scacore-dir> \
+    -o <output-dir> [options]
+
+# Raw-string input: pass a single AA sequence on the command line.
+sca-project -i <AA_SEQUENCE_STRING> --raw [--seq_id <ID>] \
     --preprocessing <preprocess-dir> \
     --scacore <scacore-dir> \
     -o <output-dir> [options]
@@ -415,9 +485,14 @@ Records whose ID is already present in the reference MSA (under `--preprocessing
 
 ### Required Arguments
 
+Exactly one of `-i/--input_fpath`, (`--from_msa` + `--seq_id`), or (`-i/--input_fpath` + `--raw`) is required.
+
 | Argument | Description |
 |----------|-------------|
-| `-i, --input_fpath` | Path to an input FASTA of sequences to project |
+| `-i, --input_fpath` | Path to an input FASTA of sequences to project, **or** (with `--raw`) a literal amino-acid sequence string. Mutually exclusive with `--from_msa` / `--seq_id` unless `--raw` is set |
+| `--raw` | Treat `-i/--input_fpath` as a literal amino-acid sequence string rather than a path. The string is uppercased and whitespace-stripped; no alphabet validation is performed (non-canonical chars pass through to the projector). Empty / all-gap inputs are still rejected. Materialized as a one-record FASTA (`raw_input.fasta`) inside the output directory |
+| `--from_msa` | Path to a (possibly aligned) FASTA from which to extract a single record by `--seq_id`. The record is ungapped and projected. Requires `--seq_id`. Mutually exclusive with `--raw` |
+| `--seq_id` | First whitespace-delimited token of the target record's header in `--from_msa`. Required with `--from_msa`. Also used as the record's ID under `--raw` (default: `raw_input`) |
 | `--preprocessing` | `sca-preprocess` output directory (must include `msa_orig.fasta-aln`) |
 | `--scacore` | `sca-core` output directory (must include `ic_positions/ic_*_msaproc.npy` and `sca_results/v_ica_normalized.npy`) |
 | `-o, --outdir` | Output directory |
@@ -427,22 +502,34 @@ Records whose ID is already present in the reference MSA (under `--preprocessing
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--aligner` | `mafft_add` | Out-of-sample alignment method. `mafft_add` uses `mafft --add --keeplength`. `hmmalign` builds a profile HMM (`hmmbuild --hand --amino`) with every reference column as a match state, then aligns new sequences (`hmmalign --outformat afa`) and keeps only match columns. In-sample records bypass alignment entirely |
+| `--align_target` | `original` | Which reference MSA the aligner uses. `original` = unfiltered loaded MSA (`msa_orig.fasta-aln`, length `L_orig`). `processed` = post-preprocessing MSA (length `L_proc`, sliced from `msa_obj_loaded` by `retained_sequences` / `retained_positions`). `processed` is denser and typically yields cleaner alignments but more aggressively clips input residues that exceed the reference column count — inspect `input_coverage_fraction` per record to detect. Affects `len(aligned_sequence)`; does **not** affect the meaning of `ic_residues` / `ic_loadings` / `ic_processed_cols` (those stay anchored to processed-MSA / raw-residue coordinates regardless) |
 | `--align_bin` | None | Explicit path to the alignment binary (default: resolve from PATH). For `--aligner hmmalign` this is `hmmalign`; `hmmbuild` is resolved from PATH |
 | `--align_threads` | 1 | Threads for the alignment tool (unused by `hmmalign`) |
+| `--save_dataframe` | off | Also write `seq_projections.tsv` with columns `seq_id`, `aligned_sequence`, `raw_sequence`, `in_sample`, `Up_0..Up_{n_components-1}`, `gap_frac_ic_0..gap_frac_ic_{n_components-1}`, `n_inform_ic_0..n_inform_ic_{n_components-1}`. When `--seq_metadata` is also supplied, the metadata's non-`seq_id` columns are merged in via left-join on `seq_id`. Requires pandas |
+| `--seq_metadata` | None | Optional path to a TSV with a `seq_id` column plus any user-supplied columns (e.g. taxid, kingdom, phylum). Persisted alongside projection outputs as `sequence_metadata.tsv` and merged into `seq_projections.tsv` via left-join on `seq_id` when `--save_dataframe` is also set. Mirrors `sca-core`'s `--seq_metadata` |
+| `--plot` / `--no-plot` | on | Write projection plots to `outdir/images/`. Default: on. Pass `--no-plot` to skip plot generation entirely (no `images/` directory is created). Mirrors `sca-core`'s `--plot`/`--no-plot` |
+| `--seq_proj_axes` | `0,1` | One or more `i,j` axis pairs (zero-indexed) for the sequence-projection scatter plot(s) — e.g. `--seq_proj_axes 0,1 0,2 1,2` produces three PNGs. Default: `0,1`. Pairs that exceed `n_components` are skipped with a warning |
+| `--seq_proj_color_by` | None | Optional column name in `--seq_metadata` to color the projection plot(s) by. Numeric columns get a colorbar; categorical columns get a legend. Mirrors `sca-core`'s `--seq_proj_color_by`; ignored with a warning when `--seq_metadata` is missing or the column is absent |
 | `-v, --verbosity` | 1 | Verbosity level |
 
 ### Output
 
 Writes to the specified output directory:
 
-- `projection.json` — top-level result: per-sequence dicts containing `seq_id`, `raw_sequence`, `aligned_sequence`, `residue_by_processed_col` (length `L_proc`), `ic_residues` (per-IC raw residue indices), `ic_loadings`, `ic_processed_cols`, `in_sample`
+- `projection.json` — top-level result: per-sequence dicts containing `seq_id`, `raw_sequence`, `aligned_sequence`, `residue_by_processed_col` (length `L_proc`), `ic_residues` (per-IC raw residue indices), `ic_loadings`, `ic_processed_cols`, `in_sample`, `up_score` (length `n_components` — the sequence's `Uᵖ` row, or `null` when the source SCAResults lacks the eigendecomposition fields), `gap_fraction_per_ic` (length `n_components` — per-IC fraction of the IC's training-time support that is gapped or non-canonical in this projection; `0.0` means full coverage), `informative_positions_per_ic` (length `n_components` — count of positions in each IC's support that contribute non-zero mass to the Uᵖ math), `align_target` (`"original"` or `"processed"` — which reference MSA the aligner used), `n_input_residues_dropped` (count of input residues that did not survive alignment, e.g. because the input was longer than the reference), `input_coverage_fraction` (`len(raw_sequence) / max(1, len(input))`; below `0.95` triggers a per-record WARNING). The two quality fields and the three new alignment-target fields are inherited verbatim by `structure_projection.json` via the nested `sequence_projection`. Per-sequence metadata is **not** carried in this JSON; it lives in the sibling `sequence_metadata.tsv` instead
 - `per_sequence/<seqid>_residues.tsv` — one row per (IC, residue) for readable inspection
+- `seq_projections.tsv` — only when `--save_dataframe`; tab-separated table with `seq_id`, `aligned_sequence`, `raw_sequence`, `in_sample`, `Up_0..Up_{n_components-1}`, `gap_frac_ic_0..gap_frac_ic_{n_components-1}`, `n_inform_ic_0..n_inform_ic_{n_components-1}` columns; with `--seq_metadata`, also picks up the metadata's non-`seq_id` columns
+- `sequence_metadata.tsv` — only when `--seq_metadata` is supplied; verbatim copy of the user-supplied metadata TSV
 - `projection_args.json` — arguments used
 - `projection.log` — run log
+- `from_msa_input.fasta` — only when `--from_msa` is used: the materialized one-record FASTA actually fed to the projector
+- `raw_input.fasta` — only when `--raw` is set: the materialized one-record FASTA holding the validated sequence string actually fed to the projector
+- `_align_workdir/processed_reference.fasta-aln` — only when `--align_target processed` is set AND at least one record needed alignment: the materialized character-space FASTA of the processed MSA (rows = `retained_sequences`, cols = `retained_positions`) that was actually fed to the aligner. Provided for transparency / debug; safe to delete
+- `images/` — only when `--plot` is on (the default); one `seq_proj_ic{i}v{j}[_by_<col>].png` per axis pair from `--seq_proj_axes`, plotting the per-sequence Uᵖ scores. Optionally colored by `--seq_proj_color_by`
 
 ### External Binaries
 
-`mafft` (for the default `mafft_add` aligner) must be resolvable via PATH or via `--align_bin`. For `--aligner hmmalign`, both `hmmbuild` and `hmmalign` must be on PATH (install via `conda install -c bioconda hmmer`). In-sample projection does not invoke any external binary.
+`mafft` (for the default `mafft_add` aligner) must be resolvable via PATH or via `--align_bin`. For `--aligner hmmalign`, both `hmmbuild` and `hmmalign` must be on PATH (install via `conda install -c conda-forge -c bioconda hmmer`). In-sample projection does not invoke any external binary.
 
 ---
 
@@ -472,6 +559,13 @@ sca-structure --uniprot_ids P06241 P12931 \
     --preprocessing <preprocess-dir> \
     --scacore <scacore-dir> \
     -o <output-dir> [options]
+
+# Auto-fetch missing PDBs into the default cache dir (./.pdb_cache/):
+sca-structure --uniprot_ids P06241 P12931 \
+    --fetch \
+    --preprocessing <preprocess-dir> \
+    --scacore <scacore-dir> \
+    -o <output-dir> [options]
 ```
 
 Exactly one of `-s/--structure`, `--seq_map`, or `--uniprot_ids` is required.
@@ -490,12 +584,17 @@ Exactly one of `-s/--structure`, `--seq_map`, or `--uniprot_ids` is required.
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--chain` | first chain | Chain ID within `-s/--structure` |
-| `--pdb_dir` | None | Directory of pre-downloaded PDB files. Required with `--uniprot_ids`; SIFTS resolves accessions but does not fetch structures |
+| `--pdb_dir` | None | Directory of pre-downloaded PDB files. Required with `--uniprot_ids` unless `--fetch` is also set, in which case it defaults to `./.pdb_cache/` and missing PDBs are downloaded into it |
 | `--cache_dir` | `./.sifts_cache` | Local directory to cache SIFTS JSON responses. Only consulted in `--uniprot_ids` mode |
+| `--fetch` | off | Opt-in: download missing PDB files from `--pdb_source` into `--pdb_dir` on demand. Off by default; without this flag, PDB files must already exist in `--pdb_dir`. Only valid with `--uniprot_ids` |
+| `--pdb_source` | `rcsb` | Source for `--fetch`. Choices: `rcsb`, `pdbe`. Only valid with `--uniprot_ids` |
+| `--pdb_form` | `asym` | Which form to fetch. Choices: `asym` (asymmetric unit `.pdb` — what most users get when hand-downloading), `assembly1` / `assembly2` (biological assembly `.pdb1` / `.pdb2`). Only valid with `--uniprot_ids` |
+| `--force_refetch` | off | Bypass the on-disk PDB cache and re-download. Distinct from any SIFTS-cache flag (the SIFTS cache stays warm). Only valid with `--uniprot_ids` + `--fetch` |
 | `--seq_id` | None | Header used when projecting `-s/--structure`'s sequence. When it matches an ID in the reference MSA, the project step takes the in-sample short-circuit. Ignored in `--seq_map` / `--uniprot_ids` modes (seq IDs come from the map / UniProt list itself) |
 | `--aligner` | `mafft_add` | Out-of-sample alignment method (inherits from `sca-project`) |
 | `--align_bin` | None | Explicit path to the alignment binary |
 | `--align_threads` | 1 | Threads for the alignment tool |
+| `--seq_metadata` | None | Optional path to a TSV with a `seq_id` column plus any user-supplied columns. Forwarded to every underlying sca-project call (one shared metadata table across all PDBs in batch mode) and persisted once at the structure outdir as `sequence_metadata.tsv`. Mirrors sca-project's `--seq_metadata` |
 | `-v, --verbosity` | 1 | Verbosity level |
 
 ### `--seq_map` TSV format
@@ -512,27 +611,44 @@ Lines starting with `#` and blank lines are ignored. Relative `pdb_path` entries
 
 Writes to the specified output directory:
 
-- `structure_projection.json` — list of per-structure dicts. Each includes `structure_id`, `chain_id`, the full raw-residue-coordinate `sequence_projection` (as per `sca-project`), and `ic_pdb_residues` (per-IC list of PDB residue numbers)
+- `structure_projection.json` — list of per-structure dicts. Each includes `structure_id`, `chain_id`, the full raw-residue-coordinate `sequence_projection` (as per `sca-project`), and `ic_pdb_residues` (per-IC list of PDB residue numbers). Per-sequence metadata is **not** carried in this JSON; it lives in the sibling `sequence_metadata.tsv` (one shared file for the whole batch) when `--seq_metadata` is supplied
 - `per_structure/<structure_id>_ic_residues.tsv` — one row per (IC, residue) including both raw residue index and PDB residue number
 - `structure_args.json` — arguments used
 - `structure.log` — run log
+- `sequence_metadata.tsv` — only when `--seq_metadata` is supplied; verbatim copy of the user-supplied metadata TSV. One file covers every PDB in batch mode
 
 ### SIFTS lookup
 
 `--uniprot_ids` resolves each UniProt accession to its top-ranked PDB structure via EBI PDBe's [`mappings/best_structures`](https://www.ebi.ac.uk/pdbe/api/doc/sifts.html) endpoint. Responses are cached under `--cache_dir` (default `./.sifts_cache/`) so repeat runs don't re-hit the network. SIFTS returns lowercase PDB IDs; the lookup tries both `{id}.pdb` and `{ID}.pdb` inside `--pdb_dir`, so either RCSB-style or lowercase filenames work.
 
-The PDB files must already exist in `--pdb_dir`; SIFTS only resolves IDs, it does not fetch structures.
+By default the PDB files must already exist in `--pdb_dir`; SIFTS only resolves IDs, it does not fetch structures. Pass `--fetch` to download missing PDBs from `--pdb_source` (`rcsb` or `pdbe`) into `--pdb_dir` on demand. The on-disk filename is always normalized to `{pdb_id_lower}.pdb` regardless of source, so the existing case-insensitive lookup keeps working. Cache hits avoid the network entirely; pass `--force_refetch` to bypass.
 
 The same mechanism is available at the library level for programmatic users:
 
 ```python
-from mysca.structure import SequencePdbMap
+from mysca.structure import SequencePdbMap, download_pdb_file
+
+# Resolution-only (today's default):
 seq_map = SequencePdbMap.from_sifts_for_uniprot_ids(
     ["P00742", "P09211", "P02768"],
     pdb_dir="./pdbs",
     cache_dir="./.sifts_cache",  # optional; default ./.sifts_cache
 )
 # seq_map["P00742"].pdb_path → "./pdbs/1c4v.pdb" (whichever case exists)
+
+# Resolution + on-demand fetch:
+seq_map = SequencePdbMap.from_sifts_for_uniprot_ids(
+    ["P00742", "P09211"],
+    pdb_dir="./.pdb_cache",
+    fetch=True,                      # download missing PDBs
+    pdb_source="rcsb",               # default
+    pdb_form="asym",                 # default
+)
+
+# Or call the fetcher directly:
+path = download_pdb_file(
+    "1SHF", dest_dir="./.pdb_cache", source="rcsb", form="asym",
+)  # → "./.pdb_cache/1shf.pdb"
 ```
 
-Missing files raise `FileNotFoundError` under `strict=True` (the default) or are logged and skipped under `strict=False`.
+Missing files (with `fetch=False` or after a failed fetch) raise `FileNotFoundError` under `strict=True` (the default) or are logged and skipped under `strict=False`.
