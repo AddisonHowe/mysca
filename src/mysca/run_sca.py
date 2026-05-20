@@ -994,12 +994,7 @@ def main(args):
     else:
         results.component_coverage_per_seq = {}
 
-    # Map processed MSA positions to original sequence positions for the
-    # rows that actually need it. Computing for `msa_obj_loaded` in full
-    # before slicing down to `sector_seqidxs` would allocate
-    # ``(n_total_seqs, n_total_positions)`` int64 — easily tens of GB on
-    # large "full" SCA inputs — only to throw all but a handful of rows
-    # away.
+    # Map processed MSA positions to original sequence positions
     sector_rawseq_idxs = get_rawseq_indices_of_msa(
         msa_obj_loaded, seqidxs=sector_seqidxs,
     )[:, retained_positions]
@@ -1015,12 +1010,7 @@ def main(args):
     group_rawseq_scores_by_entry = get_group_rawseq_scores_by_entry(
         msa_obj_loaded, sector_seqidxs, groups, group_rawseq_scores
     )
-    # Per-target IC residues (and parallel IC loadings) scale with
-    # n_components × |sector_seqidxs| and dominate on-disk size when the
-    # user requests many ICs plus `--sectors_for all`. Restrict to the
-    # kstar significant ICs; non-significant ICs still have their
-    # position arrays on disk (via SCAResults.save) but aren't expanded
-    # per sequence.
+    
     ic_residues_per_seq = {}
     ic_loadings_per_seq = {}
     n_sector_groups = min(kstar, len(groups))
