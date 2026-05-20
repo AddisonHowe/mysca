@@ -15,6 +15,7 @@ OPTIONAL_TOOLS = (
     ("hmmalign", "sca-project --aligner hmmalign (hmmer)"),
     ("mmseqs", "sca-prealign --cluster mmseqs2"),
     ("clustalo", "sca-prealign --align clustalo"),
+    ("famsa", "sca-prealign --align famsa"),
 )
 
 def remove_dir(dir:str):

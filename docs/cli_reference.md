@@ -42,7 +42,7 @@ The aligned output is written to `<output-dir>/aligned.fasta`.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--align` | `mafft` | Alignment method. Choices: `mafft`, `clustalo` |
+| `--align` | `mafft` | Alignment method. Choices: `mafft`, `clustalo`, `famsa` |
 | `--align_threads` | 1 | Threads for the alignment tool |
 | `--align_bin` | (from PATH) | Explicit path to the alignment binary |
 | `--align_extra` | [] | Raw passthrough args appended to the aligner CLI verbatim |
@@ -57,9 +57,19 @@ Each aligner's wrapper consumes a known set of keys; unknown keys raise. Bare `K
   - `guidetree_out=true` — write the guide tree to `<outdir>/guidetree.dnd`
   - `output_order=tree-order` or `output_order=input-order`
   - `seqtype=protein` (default) — overridable for nucleic acid input
+- **`famsa`**:
+  - `guidetree_out=true` — write the Newick guide tree to `<outdir>/guidetree.dnd`
+  - `gt=sl` (default), `gt=upgma`, or `gt=nj` — guide-tree method
+  - `medoidtree=true` — use FAMSA's MedoidTree heuristic (speeds up large MSAs)
+
+  FAMSA's `-keep-duplicates` is always passed by the wrapper so the input
+  record set is preserved (parity with `mafft`/`clustalo`).
 - **`mafft`**: no keys currently. Pass any raw CLI flags via `--align_extra` instead.
 
-Example: `--align clustalo --align_args guidetree_out=true output_order=tree-order`.
+Examples:
+
+- `--align clustalo --align_args guidetree_out=true output_order=tree-order`
+- `--align famsa --align_args gt=upgma medoidtree=true`
 
 ### Optional Arguments
 
@@ -74,7 +84,7 @@ Example: `--align clustalo --align_args guidetree_out=true output_order=tree-ord
 Writes to the specified output directory:
 - `aligned.fasta` or `aligned.sto` — aligned MSA (depending on `--output_format`)
 - `clustered.fasta` — clustered FASTA (only when `--cluster mmseqs2`)
-- `guidetree.dnd` — guide tree (only with `--align clustalo --align_args guidetree_out=true`)
+- `guidetree.dnd` — guide tree (only with `--align clustalo` or `--align famsa`, with `--align_args guidetree_out=true`)
 - `filter_history.json` — per-stage sequence counts (initial / cluster / align); always persisted so `sca-plots` can replay the diagnostic plot later
 - `prealign_args.json` — arguments used
 - `prealign.log` — run log
@@ -82,7 +92,7 @@ Writes to the specified output directory:
 
 ### External Binaries
 
-The aligner binary (`mafft` or `clustalo`, depending on `--align`) and `mmseqs` (when `--cluster mmseqs2`) must be resolvable on `PATH` — the CLI checks up front and raises `FileNotFoundError` immediately if a required tool is missing. Install e.g. via `conda install -c conda-forge -c bioconda mafft mmseqs2 clustalo`, or pass explicit paths with `--align_bin` / `--cluster_bin`.
+The aligner binary (`mafft`, `clustalo`, or `famsa`, depending on `--align`) and `mmseqs` (when `--cluster mmseqs2`) must be resolvable on `PATH` — the CLI checks up front and raises `FileNotFoundError` immediately if a required tool is missing. Install e.g. via `conda install -c conda-forge -c bioconda mafft mmseqs2 clustalo famsa`, or pass explicit paths with `--align_bin` / `--cluster_bin`.
 
 ---
 

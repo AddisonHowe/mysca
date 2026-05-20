@@ -3,9 +3,9 @@
 Produces an aligned FASTA (`aligned.fasta`) ready to feed into `sca-preprocess`.
 Optionally runs a clustering step first to reduce redundancy before alignment.
 
-External binaries (`mafft` or `clustalo` for the alignment step, and `mmseqs`
-if `--cluster mmseqs2`) must be available on PATH; otherwise the program
-raises FileNotFoundError and stops.
+External binaries (`mafft`, `clustalo`, or `famsa` for the alignment step, and
+`mmseqs` if `--cluster mmseqs2`) must be available on PATH; otherwise the
+program raises FileNotFoundError and stops.
 
 -------------------------------------------------------------------------------
 EXAMPLE USAGE:
@@ -18,6 +18,10 @@ EXAMPLE USAGE:
     sca-prealign -i raw.fasta -o prealign_out --align clustalo \
         --align_args guidetree_out=true output_order=tree-order
 
+    # Use FAMSA (fast on large/divergent protein families).
+    sca-prealign -i raw.fasta -o prealign_out --align famsa \
+        --align_args gt=upgma medoidtree=true
+
 Then chain into sca-preprocess:
 
     sca-preprocess -i prealign_out/aligned.fasta -o preprocess_out
@@ -26,7 +30,7 @@ Then chain into sca-preprocess:
 COMMAND LINE ARGUMENTS:
 
     Alignment group:
-        --align {mafft, clustalo}     alignment method (default mafft)
+        --align {mafft, clustalo, famsa}  alignment method (default mafft)
         --align_threads INT           threads for the aligner (default 1)
         --align_bin PATH              explicit path to the alignment binary
         --align_extra ...             raw passthrough args appended to the
@@ -45,13 +49,20 @@ COMMAND LINE ARGUMENTS:
                                       <outdir>/guidetree.dnd
             output_order={tree-order, input-order}
                                       order of aligned output
+        famsa:
+            guidetree_out=true        write Newick guide tree to
+                                      <outdir>/guidetree.dnd
+            gt={sl, upgma, nj}        guide-tree method (default: sl)
+            medoidtree=true           use MedoidTree heuristic
+                                      (speeds up large MSAs)
         mafft: (none currently)
 
 OUTPUTS (under outdir):
 
     aligned.fasta or aligned.sto      aligned MSA
     clustered.fasta                   only when --cluster is not 'none'
-    guidetree.dnd                     only with --align clustalo
+    guidetree.dnd                     only with --align clustalo or
+                                      --align famsa, with
                                       --align_args guidetree_out=true
     filter_history.json               per-stage sequence counts
     prealign_args.json                resolved arguments
@@ -158,7 +169,7 @@ def parse_args(args):
     align.add_argument(
         "--align", type=str, default="mafft",
         choices=sorted(ALIGNERS),
-        help="Alignment method. Choices: 'mafft' (default), 'clustalo'.",
+        help="Alignment method. Choices: 'mafft' (default), 'clustalo', 'famsa'.",
     )
     align.add_argument("--align_threads", type=int, default=1)
     align.add_argument("--align_bin", type=str, default=None,
@@ -176,11 +187,11 @@ def parse_args(args):
               "a bare KEY (treated as KEY=true) or KEY=VAL. The wrapper "
               "for the chosen --align consumes the keys it knows and "
               "raises on unknown keys. Use this for options that need "
-              "post-processing (e.g. clustalo guidetree_out=true writes "
-              "a guide tree under outdir). For raw passthrough to the "
-              "aligner CLI, use --align_extra instead. Examples: "
+              "post-processing (e.g. clustalo/famsa guidetree_out=true "
+              "writes a guide tree under outdir). For raw passthrough to "
+              "the aligner CLI, use --align_extra instead. Examples: "
               "`--align_args guidetree_out=true output_order=tree-order` "
-              "(clustalo)."),
+              "(clustalo); `--align_args gt=upgma medoidtree=true` (famsa)."),
     )
 
     return parser.parse_args(args)

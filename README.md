@@ -60,6 +60,7 @@ If not already available, these can be installed via conda:
 conda install -c conda-forge mafft                # sca-prealign --align mafft (default);
                                                   # sca-project --aligner mafft_add (default)
 conda install -c conda-forge clustalo             # sca-prealign --align clustalo
+conda install -c conda-forge -c bioconda famsa    # sca-prealign --align famsa
 conda install -c conda-forge -c bioconda hmmer    # sca-project --aligner hmmalign
                                                   #   (provides hmmbuild + hmmalign)
 conda install -c conda-forge -c bioconda mmseqs2  # sca-prealign --cluster mmseqs2
